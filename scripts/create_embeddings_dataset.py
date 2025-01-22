@@ -2,7 +2,7 @@ import os
 
 import pandas as pd
 
-from data.embedder import ImageBindEmbedder
+from embeddings.embedder import ImageBindEmbedder
 
 
 def create_images_dataset(images_dir: str, count: int = 10) -> pd.DataFrame:
