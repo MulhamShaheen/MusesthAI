@@ -1,3 +1,5 @@
+from typing import List
+
 import torch
 from imagebind import data
 from imagebind.models import imagebind_model
@@ -30,3 +32,13 @@ class ImageBindEmbedder:
             embeddings = self.model(inputs)
 
         return embeddings["audio"].cpu().numpy()
+
+    def embed_text(self, texts: List[str]):
+        inputs = {
+            ModalityType.TEXT: data.load_and_transform_text(texts, self.device),
+        }
+
+        with torch.no_grad():
+            embeddings = self.model(inputs)
+
+        return embeddings["text"].cpu().numpy()
