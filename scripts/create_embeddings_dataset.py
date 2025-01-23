@@ -27,17 +27,23 @@ def create_images_dataset(images_dir: str, count: int = 10) -> pd.DataFrame:
 
 
 def create_audio_dataset(audio_dir: str, count: int = 10) -> pd.DataFrame:
-    audio_files = os.listdir(audio_dir)
+    genres = []
+    audio_paths = []
 
-    step = int(len(audio_files) / count)
-    step = max(step, 1)
-    audio_files = audio_files[::step]
-    audio_paths = [os.path.join(audio_dir, f) for f in audio_files]
-    print(f"Number of audio files: {len(audio_files)}")
-    for i, f in enumerate(audio_files):
-        print(f"{i}: {f}")
+    genres_dir = os.listdir(audio_dir)
+    for genre_dir in genres_dir:
+        if not os.path.isdir(os.path.join(audio_dir, genre_dir)):
+            continue
+        genre_dir_path = os.path.join(audio_dir, genre_dir)
+        genre_audio_files = os.listdir(genre_dir_path)
+        audio_paths.extend([os.path.join(genre_dir_path, f) for f in genre_audio_files])
+        genres.extend([genre_dir] * len(genre_audio_files))
+        print(f"Number of audio files in {genre_dir}: {len(audio_paths)}")
+        for i, f in enumerate(audio_paths):
+            print(f"{i}: {f}")
 
-    df = pd.DataFrame(audio_files, columns=["audio_path"], index=range(len(audio_files)))
+    df = pd.DataFrame({"audio_path": audio_paths, "genre": genres}, columns=["audio_path", "genre"],
+                      index=range(len(audio_paths)))
 
     embedder = ImageBindEmbedder()
     embeddings = embedder.embed_audio(audio_paths)
@@ -47,4 +53,4 @@ def create_audio_dataset(audio_dir: str, count: int = 10) -> pd.DataFrame:
     return df
 
 
-create_audio_dataset("../data/music", count=1)
+create_images_dataset("../data/images/imagesf2", count=500)

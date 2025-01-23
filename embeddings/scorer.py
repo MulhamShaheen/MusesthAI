@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import numpy as np
 from imagebind.models.imagebind_model import ModalityType
 from sklearn.metrics.pairwise import cosine_similarity
@@ -15,7 +17,7 @@ class EmbeddingScorer:
         else:
             raise ValueError('Unknown metric: {}'.format(self.metric))
 
-    def find_topk(self, query: np.ndarray, targets: np.ndarray, top_k: int = 5) -> np.ndarray:
+    def find_topk(self, query: np.ndarray, targets: np.ndarray, top_k: int = 5) -> Tuple[np.ndarray, np.ndarray]:
         scores = self.score(query, targets)
-        topk_indices = np.argsort(scores)[::-1][:top_k]
-        return topk_indices
+        topk_indices = np.argsort(scores)[0][::-1][:top_k]
+        return topk_indices, scores[0][topk_indices]
