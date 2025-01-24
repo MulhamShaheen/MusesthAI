@@ -51,6 +51,3 @@ def create_audio_dataset(audio_dir: str, count: int = 10) -> pd.DataFrame:
 
     df.to_csv("../data/audio_dataset.csv", index=False)
     return df
-
-
-create_images_dataset("../data/images/imagesf2", count=500)

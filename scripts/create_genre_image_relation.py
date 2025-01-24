@@ -1,5 +1,5 @@
 import ast
-import os
+import json
 from typing import List
 
 import numpy as np
@@ -8,14 +8,13 @@ import pandas as pd
 from embeddings.embedder import ImageBindEmbedder
 from embeddings.scorer import EmbeddingScorer
 
-GENRES = ["blues", "classical", "country", "disco", "hiphop", "jazz", "metal", "pop", "reggae", "rock"]
-
+GENRES_DICT = json.load(open("../data/text/genres.json", "r"))
 
 def create_genre_text_embeddings(genres: List[str] = None, save_file: bool = False) -> pd.DataFrame:
     if genres is None:
-        genres = GENRES
+        genres = GENRES_DICT.keys()
     embedder = ImageBindEmbedder()
-    embeddings = embedder.embed_text(genres)
+    embeddings = embedder.embed_text([GENRES_DICT[genre] for genre in genres])
 
     df = pd.DataFrame({"genre": genres, "embeddings": embeddings.tolist()}, columns=["genre", "embeddings"],
                       index=range(len(genres)))
