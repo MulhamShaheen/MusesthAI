@@ -5,7 +5,7 @@ import pandas as pd
 from embeddings.embedder import ImageBindEmbedder
 
 
-def create_images_dataset(images_dir: str, count: int = 10) -> pd.DataFrame:
+def create_images_dataset(images_dir: str, output_path: str = "../data/images_dataset.csv", count: int = 10) -> pd.DataFrame:
     image_files = os.listdir(images_dir)
     image_files = [f for f in image_files if f.endswith(".jpg")]
 
@@ -22,8 +22,32 @@ def create_images_dataset(images_dir: str, count: int = 10) -> pd.DataFrame:
     embeddings = embedder.embed_image(image_paths)
     df["embeddings"] = embeddings.tolist()
 
-    df.to_csv("../data/images_dataset.csv", index=False)
+    df.to_csv(output_path, index=False)
     return df
+
+
+def batch_create_images_dataset(images_dir: str, output_dir: str, batch_size: int = 10, count: int = 100):
+    image_files = os.listdir(images_dir)
+    image_files = [f for f in image_files if f.endswith(".jpg")]
+    embedded_count = 0
+    for i in range(0, len(image_files), batch_size):
+        if embedded_count >= count:
+            break
+        batch_image_files = image_files[i:i + batch_size]
+        batch_image_paths = [os.path.join(images_dir, f) for f in batch_image_files]
+        print(f"Number of images: {len(batch_image_files)}")
+        for j, f in enumerate(batch_image_files):
+            print(f"{j}: {f}")
+
+        df = pd.DataFrame(batch_image_files, columns=["image_path"], index=range(len(batch_image_files)))
+
+        embedder = ImageBindEmbedder()
+        embeddings = embedder.embed_image(batch_image_paths)
+        df["embeddings"] = embeddings.tolist()
+
+        output_path = os.path.join(output_dir, f"images_dataset_{i}.csv")
+        df.to_csv(output_path, index=False)
+        embedded_count += len(batch_image_files)
 
 
 def create_audio_dataset(audio_dir: str, count: int = 10) -> pd.DataFrame:
