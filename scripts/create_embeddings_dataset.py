@@ -42,7 +42,7 @@ def batch_create_images_dataset(images_dir: str, output_dir: str, batch_size: in
         batch_image_files = image_files[i:i + batch_size]
         batch_image_paths = [os.path.join(images_dir, f) for f in batch_image_files]
         for j, f in enumerate(batch_image_files):
-            print(f"{j}: {f}")
+            print(f"{j + i}: {f}")
 
         batch_embeddings = embedder.embed_image(batch_image_paths)
         embeddings.extend(batch_embeddings)
