@@ -1,3 +1,3 @@
-import generator as generator
+from .generator import TestImageGenerator
 
-__all__ = ["generator"]
+__all__ = ["TestImageGenerator"]
