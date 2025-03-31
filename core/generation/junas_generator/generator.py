@@ -36,6 +36,12 @@ class JanusImageGenerator(BaseImageGenerator, ABC):
 
         cls.model = test_model
 
+        # hardcoded need to learn more about this
+        cls.parallel_size = 1
+        cls.img_size = 384
+        cls. patch_size = 16
+
+
     @classmethod
     def _preprocess_input(cls, inputs):
         conversation = [
@@ -68,23 +74,20 @@ class JanusImageGenerator(BaseImageGenerator, ABC):
                      temperature: float = 1,
                      cfg_weight: float = 5,
                      image_token_num_per_image: int = 576,
-                     img_size: int = 384,
-                     patch_size: int = 16, **kwargs):
-
-        parallel_size = 1  # hardcoded need to learn more about this
+                     **kwargs):
 
         input_ids = cls.vl_chat_processor.tokenizer.encode(prompt)
         input_ids = torch.LongTensor(input_ids)
 
-        tokens = torch.zeros((parallel_size * 2, len(input_ids)), dtype=torch.int).cuda()
-        for i in range(parallel_size * 2):
+        tokens = torch.zeros((cls.parallel_size * 2, len(input_ids)), dtype=torch.int).cuda()
+        for i in range(cls.parallel_size * 2):
             tokens[i, :] = input_ids
             if i % 2 != 0:
                 tokens[i, 1:-1] = cls.vl_chat_processor.pad_id
-
+        cls.vl_gpt.language_model.config._attn_implementation = 'eager'
         inputs_embeds = cls.vl_gpt.language_model.get_input_embeddings()(tokens)
 
-        generated_tokens = torch.zeros((parallel_size, image_token_num_per_image), dtype=torch.int).cuda()
+        generated_tokens = torch.zeros((cls.parallel_size, image_token_num_per_image), dtype=torch.int).cuda()
 
         for i in range(image_token_num_per_image):
             outputs = cls.vl_gpt.language_model.model(inputs_embeds=inputs_embeds, use_cache=True,
@@ -106,8 +109,20 @@ class JanusImageGenerator(BaseImageGenerator, ABC):
             inputs_embeds = img_embeds.unsqueeze(dim=1)
 
         dec: torch.Tensor = cls.vl_gpt.gen_vision_model.decode_code(generated_tokens.to(dtype=torch.int),
-                                                      shape=[parallel_size, 8, img_size // patch_size,
-                                                             img_size // patch_size])
+                                                                    shape=[cls.parallel_size, 8, cls.img_size // cls.patch_size,
+                                                                           cls.img_size // cls.patch_size])
         dec = dec.to(torch.float32).cpu().permute(0, 2, 3, 1)[0]
 
         return dec
+
+    @classmethod
+    def generate_from_embeds(cls, inputs: np.ndarray) -> np.ndarray:
+        input_tensor = torch.from_numpy(inputs).cuda().int()
+
+        # invoke Decoder of the VQ Model to generate the image from latent
+        dec = cls.vl_gpt.gen_vision_model.decode_code(input_tensor, shape=[cls.parallel_size, 8, cls.img_size // cls.patch_size,])
+
+        dec = dec.to(torch.float32).cpu().permute(0, 2, 3, 1)[0]
+        image = cls._postprocess_output(dec)
+        return image
+
