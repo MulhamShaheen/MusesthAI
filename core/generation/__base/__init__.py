@@ -1,3 +1,3 @@
-from generator import BaseImageGenerator
+from .generator import BaseImageGenerator
 
 __all__ = ["BaseImageGenerator"]

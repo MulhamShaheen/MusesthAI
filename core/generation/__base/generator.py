@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
 
 import PIL.Image as Image
 import torch
@@ -7,11 +7,11 @@ import torch
 
 class BaseImageGenerator(ABC):
     name: str
-    model: object | callable = None
+    model: Any | Callable = None
 
     @classmethod
     @abstractmethod
-    def init_model(cls, config: Any):
+    def init_model(cls, config: Any, **kwargs):
         pass
 
     @classmethod
