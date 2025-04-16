@@ -1,0 +1,8 @@
+imagebind @ file:///mnt/e/AI%20Talent%20Hub/MusesthAI/ImageBind
+-e git+https://github.com/deepseek-ai/Janus.git@1daa72fa409002d40931bd7b36a9280362469ead#egg=janus
+ninja==1.11.1.4
+numpy==2.2.4
+pytorchvideo @ git+https://github.com/facebookresearch/pytorchvideo.git@28fe037d212663c6a24f373b94cc5d478c8c1a1d
+torch==2.6.0
+torchaudio==2.6.0
+torchvision==0.21.0
