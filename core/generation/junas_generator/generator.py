@@ -9,7 +9,7 @@ from janus.models import MultiModalityCausalLM, VLChatProcessor
 from core.generation.__base import BaseImageGenerator
 from utils import logs
 
-AVAILABLE_MODELS = ["Janus-1.3B", "Janus-Pro-7B", "JanusFlow-1.3B"]
+AVAILABLE_MODELS = ["Janus-1.3B", "Janus-Pro-1B", "JanusFlow-1.3B"]
 
 logger = logs.create_logger(__name__.split(".")[-1])
 
@@ -19,7 +19,7 @@ class JanusImageGenerator(BaseImageGenerator, ABC):
 
     @classmethod
     def init_model(cls, config):
-        model_name = config.get("model_name", "Janus-1.3B")
+        model_name = config.get("model_name", "Janus-Pro-1B")
         cls.sys_prompt = config.get("sys_prompt", "Abstract art for representing emotions")
         if model_name not in AVAILABLE_MODELS:
             logger.warning(f"Model {model_name} not available. Using {AVAILABLE_MODELS[0]} instead.")
@@ -62,7 +62,7 @@ class JanusImageGenerator(BaseImageGenerator, ABC):
 
     @classmethod
     def _postprocess_output(cls, outputs):
-        concated = torch.cat([outputs, torch.zeros_like(outputs)], dim=1)
+        # concated = torch.cat([outputs, torch.zeros_like(outputs)], dim=1)
         outputs = outputs.numpy()
         outputs = np.clip((outputs + 1) / 2 * 255, 0, 255)
         image = Image.fromarray(outputs.astype(np.uint8))
@@ -88,7 +88,7 @@ class JanusImageGenerator(BaseImageGenerator, ABC):
         cls.vl_gpt.language_model.config._attn_implementation = 'eager'
 
         inputs_embeds = cls.vl_gpt.language_model.get_input_embeddings()(tokens)
-        if audio_embeds:
+        if audio_embeds is not None:
             inputs_embeds = torch.cat([audio_embeds, inputs_embeds], dim=1)
 
         generated_tokens = torch.zeros((cls.parallel_size, image_token_num_per_image), dtype=torch.int).cuda()
@@ -121,11 +121,11 @@ class JanusImageGenerator(BaseImageGenerator, ABC):
         return dec
 
     @classmethod
-    def generate_from_embeds(cls, inputs: np.ndarray) -> np.ndarray:
+    def generate_from_embeds(cls, inputs: np.ndarray) -> Image:
         prompt = cls._preprocess_input(cls.sys_prompt)
         input_tensor = torch.from_numpy(inputs).to(cls.audio_embeds_type).cuda()
 
-        if all([input_tensor.shape[d] == s for d, s in cls.audio_embeds_shape.items()]):
+        if not all([input_tensor.shape[d] == s for d, s in cls.audio_embeds_shape.items()]):
             logger.error(f"Input tensor had shape {inputs.shape} was expected {cls.audio_embeds_shape}")
 
         output = cls.invoke_model(prompt, audio_embeds=input_tensor)

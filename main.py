@@ -18,9 +18,9 @@ model.to(device)
 
 # Load data
 inputs = {
-    ModalityType.TEXT: data.load_and_transform_text(text_list, device),
+    # ModalityType.TEXT: data.load_and_transform_text(text_list, device),
     ModalityType.VISION: data.load_and_transform_vision_data(image_paths, device),
-    ModalityType.AUDIO: data.load_and_transform_audio_data(audio_paths, device),
+    # ModalityType.AUDIO: data.load_and_transform_audio_data(audio_paths, device),
 }
 
 with torch.no_grad():

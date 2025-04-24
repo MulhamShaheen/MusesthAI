@@ -1,4 +1,6 @@
-/ImageBind/
+/ImageBind/*
 /Janus/*
 venv
 venv-310
+image_generation
+.*
