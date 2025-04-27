@@ -1,11 +1,16 @@
 from abc import ABC
+from typing import Tuple, List
 
+import PIL.Image
 import numpy as np
 import torch
 from PIL import Image
+from einops import rearrange
 
 from transformers import AutoModelForCausalLM
 from janus.models import MultiModalityCausalLM, VLChatProcessor
+from transformers.models.bart.modeling_bart import shift_tokens_right
+
 from core.generation.__base import BaseImageGenerator
 from utils import logs
 
@@ -131,3 +136,36 @@ class JanusImageGenerator(BaseImageGenerator, ABC):
         output = cls.invoke_model(prompt, audio_embeds=input_tensor)
         image = cls._postprocess_output(output)
         return image
+
+    @classmethod
+    def get_image_embeds(cls, imgs: List[PIL.Image.Image]) -> Tuple[torch.Tensor, torch.Tensor]:
+        prepare = cls.vl_chat_processor.process_one(prompt="<image_placeholder>", images=imgs)
+        images = rearrange(prepare.pixel_values.unsqueeze(0).to(torch.bfloat16).to("cuda:0"),
+                           "b n c h w -> (b n) c h w")
+        quant, _, info = cls.vl_gpt.gen_vision_model.encode(images)  # torch.Size([1, 3, 384, 384])
+        B, C, Hq, Wq = quant.shape
+        _, _, min_encoding_indices = info
+        image_ids = min_encoding_indices.view(B, Hq * Wq)
+        gen_embeds = cls.vl_gpt.prepare_gen_img_embeds(image_ids)
+
+        return image_ids, gen_embeds
+
+    @classmethod
+    def shift_image_tokens(cls, image_ids: torch.Tensor):
+
+        image_embeds_shifted = shift_tokens_right(
+            image_ids,
+            pad_token_id=cls.vl_chat_processor.pad_id,
+            decoder_start_token_id=cls.vl_chat_processor.image_start_id
+        )
+        return image_embeds_shifted
+
+    @classmethod
+    def get_text_embeds(cls, text: str) -> torch.Tensor:
+
+        prompt = cls._preprocess_input(text)
+
+        input_ids = cls.vl_chat_processor.tokenizer.encode(prompt)
+        input_ids = torch.LongTensor(input_ids)
+
+        return input_ids
