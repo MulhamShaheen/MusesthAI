@@ -24,6 +24,6 @@ with torch.no_grad():
     logits = JG.vl_gpt.gen_head(hidden_states)
     logits = logits.permute(0, 2, 1)
 
-    image_ids = image_ids.squeeze(-1)  # torch.Size([1, 608, 2048])
+    image_ids = image_ids.squeeze(-1)
     shifted_image_ids = JG.shift_image_tokens(image_ids)  # torch.Size([1, 576])
     loss = cross_entropy(logits[:, :, -image_ids.shape[-1]:], shifted_image_ids, ignore_index=-100)
