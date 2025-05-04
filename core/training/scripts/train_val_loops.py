@@ -3,6 +3,8 @@ import torch
 import numpy as np
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
 from tqdm.auto import tqdm
 from PIL import Image
 from torchvision.transforms import ToTensor
@@ -94,6 +96,10 @@ def val_loop(model, processor, projection, val_dataloader, epoch=1, no_loss=Fals
     criterion = nn.CrossEntropyLoss(ignore_index=processor.pad_id)
     sumloss = 0
     num_batches = 0
+
+    fid = FrechetInceptionDistance(feature=2048).to(model.device)
+    inception_score = InceptionScore(feature='logits_unbiased', splits=10).to(model.device)
+
     # hardcoded values
     cfg_weight = 5
     temperature = 1
@@ -160,21 +166,31 @@ def val_loop(model, processor, projection, val_dataloader, epoch=1, no_loss=Fals
             dec = model.gen_vision_model.decode_code(generated_tokens.to(dtype=torch.int),
                                                      shape=[parallel_size, 8, img_size // patch_size,
                                                             img_size // patch_size])
-            dec = dec.to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
-            dec = np.clip((dec + 1) / 2 * 255, 0, 255)
-            visual_img = np.zeros((parallel_size, img_size, img_size, 3), dtype=np.uint8)
-            visual_img[:, :, :] = dec
+            dec = dec.to(torch.float32)
+            dec = torch.clamp((dec + 1) / 2 * 255, min=0, max=255)
 
-            # get Fréchet Inception Distance
-            # get Inception Score
-            # get ImageBind similarity?
+            visual_img = dec.to(torch.uint8)
+            target_images = batch["images"].cuda()
+
+            if target_images.dtype != torch.uint8:
+                target_images = (target_images * 255.0).to(torch.uint8)
+            if target_images.shape[1] != 3:
+                target_images = target_images.permute(0, 3, 1, 2)
+
+            fid.update(target_images, real=True)
+            fid.update(visual_img, real=False)
+            inception_score.update(visual_img)
+
+        final_fid_score = fid.compute()
+        final_is_mean, final_is_std = inception_score.compute()
 
     val_res = {
         "loss": sumloss / num_batches if num_batches > 0 else 0,
         "num_batches": num_batches,
+        "fid": final_fid_score,
+        "is_mean": final_is_mean,
+        "is_mean": final_is_std,
         # mock values
-        "fid": 0,
-        "is": 0,
         "imagebind_sim": 0,
     }
 
