@@ -52,7 +52,7 @@ def get_collate_fn(gen_model: MultiModalityCausalLM):
     def collate_fn(items):
         result = dict()
         with torch.no_grad():
-            images = torch.stack([item["image"] for item in items], dim=1)
+            images = torch.cat([item["image"] for item in items], dim=0)
             quant, _, info = gen_model.gen_vision_model.encode(
                 images.squeeze(0).to(dtype=torch.bfloat16).cuda())
             B, C, Hq, Wq = quant.shape
