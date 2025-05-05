@@ -274,7 +274,7 @@ def train(
         train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch=epoch, criterion=criterion, train_config=train_config)
 
         if epoch % train_config.evaluate_every_epoch_mod == 0:
-            validation_metrics = val_loop(model, processor, projection, val_dataloader, epoch=epoch, metrics=metrics)
+            validation_metrics = val_loop(model, processor, projection, val_dataloader, epoch=epoch, metrics=metrics, generate_freq=1)
 
             last_fid = validation_metrics['fid']
             # metric_logger.log(validation_metrics)
@@ -300,7 +300,7 @@ if __name__ == "__main__":
     # Example dataset
     import pandas as pd
 
-    matched_df_path = "../../../data/notebooks/matched_dataset_concat.pkl"
+    matched_df_path = os.path.join(os.getcwd(), "data/matched_dataset_concat.pkl")
     matched_df = pd.read_pickle(matched_df_path)
     dataset = ImageAudioDataset(matched_df)
 
@@ -311,11 +311,11 @@ if __name__ == "__main__":
     # Projection model
     projection = AudioProjection(1024, 2048, scale_factor=2).cuda()
 
-    # Training and validation
-    accelerator = Accelerator()
-    optimizer = Adam(projection.parameters(), lr=1e-4)
-    criterion = nn.CrossEntropyLoss()
-
-    train_loop(accelerator, vl_gpt, projection, optimizer, train_dataloader, epoch=1, criterion=criterion,
-               train_config=None)
-    val_loop(vl_gpt, vl_chat_processor, projection, val_dataloader, epoch=1, generate_freq=1)
+    train(
+        model=vl_gpt,
+        projection=projection,
+        processor=vl_chat_processor,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        train_config=TrainConfig,
+    )
