@@ -19,10 +19,13 @@ from core.projection import AudioProjection
 class ImageAudioDataset(Dataset):
     def __init__(self, dataframe, transform=None):
         self.dataframe = dataframe
+        current_path = os.getcwd()
+
         self.dataframe["image_path"] = self.dataframe["image_path"].apply(
-            lambda x: os.path.abspath(x.replace("\\", "/")))
+            lambda x: os.path.abspath(os.path.join(current_path, "data/" + x.split("data")[-1].replace("\\", "/"))))
+
         self.dataframe["audio_path"] = self.dataframe["audio_path"].apply(
-            lambda x: os.path.abspath(x.replace("\\", "/")))
+            lambda x: os.path.abspath(os.path.join(current_path, "data/" + x.split("data")[-1].replace("\\", "/"))))
         self.transform = transform
 
     def __len__(self):
@@ -271,10 +274,12 @@ def train(
     }
 
     for epoch in range(train_config.num_epochs):
-        train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch=epoch, criterion=criterion, train_config=train_config)
+        train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch=epoch, criterion=criterion,
+                   train_config=train_config)
 
         if epoch % train_config.evaluate_every_epoch_mod == 0:
-            validation_metrics = val_loop(model, processor, projection, val_dataloader, epoch=epoch, metrics=metrics, generate_freq=1)
+            validation_metrics = val_loop(model, processor, projection, val_dataloader, epoch=epoch, metrics=metrics,
+                                          generate_freq=1)
 
             last_fid = validation_metrics['fid']
             # metric_logger.log(validation_metrics)
@@ -288,6 +293,7 @@ def freeze_model(model):
     for p in model.parameters():
         p.requires_grad = False
     return
+
 
 if __name__ == "__main__":
     # Example usage
