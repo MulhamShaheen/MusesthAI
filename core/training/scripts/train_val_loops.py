@@ -1,4 +1,6 @@
 import os
+
+import accelerate
 import torch
 import numpy as np
 from torch import nn
@@ -11,6 +13,7 @@ from torchvision.transforms import ToTensor
 from accelerate import Accelerator
 from torch.optim import Adam
 from Janus.janus.models import MultiModalityCausalLM, VLChatProcessor
+from core.projection import AudioProjection
 
 
 class ImageAudioDataset(Dataset):
@@ -73,7 +76,8 @@ def train_loop(accelerator, model, projection, optimizer, train_dataloader, epoc
     progress_bar = tqdm(range(len(train_dataloader)), desc=f"Epoch {epoch}")
     for batch in train_dataloader:
         with accelerator.accumulate(projection):
-            audio_input = projection(batch["music_embedding"]).to(torch.bfloat16)
+            music_embedding = batch["music_embedding"].to(model.device)
+            audio_input = projection(music_embedding).to(torch.bfloat16)
             image_gen_embeds = batch["image_gen_embeds"].to(torch.bfloat16)
             image_ids = batch["image_ids"]
 
@@ -90,15 +94,21 @@ def train_loop(accelerator, model, projection, optimizer, train_dataloader, epoc
             progress_bar.update(1)
             progress_bar.set_description(f'Epoch={epoch} Loss={loss.item():.3f}')
 
+            return
+
 
 @torch.no_grad()
-def val_loop(model, processor, projection, val_dataloader, epoch=1, no_loss=False, generate_freq=0):
+def val_loop(model, processor, projection, val_dataloader, metrics: dict = None, epoch=1, no_loss=False,
+             generate_freq=0):
     criterion = nn.CrossEntropyLoss(ignore_index=processor.pad_id)
     sumloss = 0
     num_batches = 0
-
-    fid = FrechetInceptionDistance(feature=2048).to(model.device)
-    inception_score = InceptionScore(feature='logits_unbiased', splits=10).to(model.device)
+    if not metrics:
+        fid = FrechetInceptionDistance(feature=2048).to(model.device)
+        inception_score = InceptionScore(feature='logits_unbiased', splits=10).to(model.device)
+    else:
+        fid = metrics['fid']
+        inception_score = metrics['inception_score']
 
     # hardcoded values
     cfg_weight = 5
@@ -113,13 +123,15 @@ def val_loop(model, processor, projection, val_dataloader, epoch=1, no_loss=Fals
     projection.eval()
     for batch in tqdm(val_dataloader):
         batch_input_ids = batch['image_ids'].to(model.device)
-        music_embedding = projection(batch["music_embedding"]).to(torch.bfloat16).cuda()
-        image_gen_embeds = batch["image_gen_embeds"].to(torch.bfloat16)
+        music_embedding = batch["music_embedding"].to(model.device)
+        music_embedding = projection(music_embedding).to(torch.bfloat16)
+        image_gen_embeds = batch["image_gen_embeds"].to(model.device).to(torch.bfloat16)
+
         input_embeds = torch.concat([music_embedding, image_gen_embeds], dim=1)
 
         if not no_loss:
             outputs = model.language_model.model(inputs_embeds=input_embeds, use_cache=False, past_key_values=None,
-                                          decoder_input_ids=1)
+                                                 decoder_input_ids=1)
             hidden_states = outputs.last_hidden_state
             logits = model.gen_head(hidden_states)
             logits = logits.permute(0, 2, 1)
@@ -144,9 +156,9 @@ def val_loop(model, processor, projection, val_dataloader, epoch=1, no_loss=Fals
                     gen_input_embeds[i] = input_embeds[i // 2]
 
             generated_tokens = torch.zeros((parallel_size, batch_input_ids.shape[-1]), dtype=torch.int).cuda()
-
+            inputs_embeds = gen_input_embeds
             for i in range(batch_input_ids.shape[-1]):
-                outputs = model.language_model.model(inputs_embeds=gen_input_embeds, use_cache=True,
+                outputs = model.language_model.model(inputs_embeds=inputs_embeds, use_cache=True,
                                                      past_key_values=outputs.past_key_values if i != 0 else None)
                 hidden_states = outputs.last_hidden_state
                 logits = model.gen_head(hidden_states[:, -1, :])
@@ -179,6 +191,9 @@ def val_loop(model, processor, projection, val_dataloader, epoch=1, no_loss=Fals
 
             fid.update(target_images, real=True)
             fid.update(visual_img, real=False)
+            fid.update(target_images, real=True)
+            fid.update(visual_img, real=False)
+            inception_score.update(visual_img)
             inception_score.update(visual_img)
 
         final_fid_score = fid.compute()
@@ -189,7 +204,7 @@ def val_loop(model, processor, projection, val_dataloader, epoch=1, no_loss=Fals
         "num_batches": num_batches,
         "fid": final_fid_score,
         "is_mean": final_is_mean,
-        "is_mean": final_is_std,
+        "is_std": final_is_std,
         # mock values
         "imagebind_sim": 0,
     }
@@ -197,15 +212,95 @@ def val_loop(model, processor, projection, val_dataloader, epoch=1, no_loss=Fals
     return val_res
 
 
+class TrainConfig:
+    log_level = "DEBUG"
+
+    num_epochs = 1
+    train_batch_size = 2
+    val_batch_size = 1
+    log_grad_norm = True
+    learning_rate = 1e-4
+    gradient_accumulation_steps = 1
+
+    evaluate_every_epoch_mod = 4
+    save_model_every_epoch_mod = 1
+    device = "cuda:0"
+
+    # Model
+
+    # Projector
+    projector_input_dim = 1024
+
+    # Data
+    few_train_samples = None
+    few_val_samples = 100
+    dataloader_num_workers = 0
+
+    train_dataset_path = ""
+    audio_embeds_train_prefix = ""
+
+    val_dataset_path = ""
+    audio_embeds_val_prefix = ""
+
+
+def train(
+        model: MultiModalityCausalLM,
+        projection: AudioProjection,
+        processor: VLChatProcessor,
+        train_dataloader: DataLoader,
+        val_dataloader: DataLoader,
+        train_config: TrainConfig,
+        device_placement=True,
+):
+    best_fid = 0
+
+    trainable_parameters = list(projection.parameters())
+    optimizer = Adam(trainable_parameters, lr=train_config.learning_rate)
+    criterion = nn.CrossEntropyLoss()
+
+    accelerator = accelerate.Accelerator(device_placement=device_placement)
+    accelerator.gradient_accumulation_steps = train_config.gradient_accumulation_steps
+
+    model, projection, optimizer, train_dataloader, val_dataloader = accelerator.prepare(model, projection, optimizer,
+                                                                                         train_dataloader,
+                                                                                         val_dataloader)
+
+    metrics = {
+        "fit": FrechetInceptionDistance(feature=2048).to(model.device),
+        "inception_score": InceptionScore(feature='logits_unbiased', splits=10).to(model.device)
+    }
+
+    for epoch in range(train_config.num_epochs):
+        train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch=epoch, criterion=criterion, train_config=train_config)
+
+        if epoch % train_config.evaluate_every_epoch_mod == 0:
+            validation_metrics = val_loop(model, processor, projection, val_dataloader, epoch=epoch, metrics=metrics)
+
+            last_fid = validation_metrics['fid']
+            # metric_logger.log(validation_metrics)
+            print(f"Epoch {epoch} validation metrics: {validation_metrics}")
+            if last_fid < best_fid or best_fid == 0:
+                best_fid = last_fid
+                print("New best fid: ", best_fid)
+
+
+def freeze_model(model):
+    for p in model.parameters():
+        p.requires_grad = False
+    return
+
 if __name__ == "__main__":
     # Example usage
     model_path = "deepseek-ai/Janus-Pro-1B"
     vl_chat_processor = VLChatProcessor.from_pretrained(model_path)
     vl_gpt = MultiModalityCausalLM.from_pretrained(model_path, trust_remote_code=True).to(torch.bfloat16).cuda().eval()
 
+    freeze_model(vl_gpt)
+
     # Example dataset
     import pandas as pd
-    matched_df_path = "../data/notebooks/matched_dataset_concat.pkl"
+
+    matched_df_path = "../../../data/notebooks/matched_dataset_concat.pkl"
     matched_df = pd.read_pickle(matched_df_path)
     dataset = ImageAudioDataset(matched_df)
 
@@ -214,12 +309,13 @@ if __name__ == "__main__":
     val_dataloader = DataLoader(dataset, batch_size=2, shuffle=False, collate_fn=get_collate_fn(vl_gpt))
 
     # Projection model
-    projection = nn.Linear(1024, 2048)
+    projection = AudioProjection(1024, 2048, scale_factor=2).cuda()
 
     # Training and validation
     accelerator = Accelerator()
     optimizer = Adam(projection.parameters(), lr=1e-4)
     criterion = nn.CrossEntropyLoss()
 
-    train_loop(accelerator, vl_gpt, projection, optimizer, train_dataloader, epoch=1, criterion=criterion, train_config=None)
-    val_loop(vl_gpt, vl_chat_processor, projection, val_dataloader, epoch=1)
+    train_loop(accelerator, vl_gpt, projection, optimizer, train_dataloader, epoch=1, criterion=criterion,
+               train_config=None)
+    val_loop(vl_gpt, vl_chat_processor, projection, val_dataloader, epoch=1, generate_freq=1)
