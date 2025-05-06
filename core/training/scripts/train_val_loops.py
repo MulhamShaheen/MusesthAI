@@ -266,6 +266,7 @@ def train(
         val_dataloader: DataLoader,
         train_config: TrainConfig,
         device_placement=True,
+        mock_run: bool = False,
 ):
     best_fid = 0
     wandb.init(project="mususthai-training")
@@ -289,13 +290,13 @@ def train(
 
     for epoch in range(train_config.num_epochs):
         train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch=epoch, criterion=criterion,
-                   train_config=train_config)
+                   train_config=train_config, mock_run=mock_run)
         wandb.log({"train/loss": train_loss}, step=epoch)
 
         if epoch % train_config.evaluate_every_epoch_mod == 0:
             print("Evaluating model for epoch: ", epoch)
             validation_metrics = val_loop(model, processor, projection, val_dataloader, epoch=epoch, metrics=metrics,
-                                          generate_freq=1)
+                                          generate_freq=1, mock_run=mock_run)
             final_fid_score = validation_metrics["fid"]
             print(f"Epoch {epoch} validation metrics: {validation_metrics}")
 
@@ -351,4 +352,5 @@ if __name__ == "__main__":
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         train_config=TrainConfig,
+        mock_run=True,
     )
