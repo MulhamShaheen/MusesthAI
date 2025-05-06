@@ -14,6 +14,7 @@ from accelerate import Accelerator
 from torch.optim import Adam
 from Janus.janus.models import MultiModalityCausalLM, VLChatProcessor
 from core.projection import AudioProjection
+import wandb
 
 
 class ImageAudioDataset(Dataset):
@@ -217,9 +218,9 @@ def val_loop(model, processor, projection, val_dataloader, metrics: dict = None,
 class TrainConfig:
     log_level = "DEBUG"
 
-    num_epochs = 1
+    num_epochs = 2
     train_batch_size = 40
-    val_batch_size = 10
+    val_batch_size = 5
     log_grad_norm = True
     learning_rate = 1e-4
     gradient_accumulation_steps = 1
@@ -255,12 +256,14 @@ def train(
         device_placement=True,
 ):
     best_fid = 0
+    wandb.init(project="mususthai-training")
+    wandb.config.update(train_config.__dict__)
 
     trainable_parameters = list(projection.parameters())
     optimizer = Adam(trainable_parameters, lr=train_config.learning_rate)
     criterion = nn.CrossEntropyLoss()
 
-    accelerator = accelerate.Accelerator(device_placement=device_placement)
+    accelerator = accelerate.Accelerator(device_placement=device_placement, log_with="wandb")
     accelerator.gradient_accumulation_steps = train_config.gradient_accumulation_steps
 
     model, projection, optimizer, train_dataloader, val_dataloader = accelerator.prepare(model, projection, optimizer,
@@ -275,19 +278,21 @@ def train(
     for epoch in range(train_config.num_epochs):
         train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch=epoch, criterion=criterion,
                    train_config=train_config)
+        wandb.log({"train/loss": train_loss}, step=epoch)
 
         if epoch % train_config.evaluate_every_epoch_mod == 0:
             print("Evaluating model for epoch: ", epoch)
             validation_metrics = val_loop(model, processor, projection, val_dataloader, epoch=epoch, metrics=metrics,
                                           generate_freq=1)
-
-            final_fid_score = metrics["fid"].compute()
-            final_is_mean, final_is_std =  metrics["inception_score"].compute()
-            validation_metrics["fid"] = final_fid_score
-            validation_metrics["is_mean"] = final_is_mean
-            validation_metrics["is_std"] = final_is_std
-
+            final_fid_score = validation_metrics["fid"]
             print(f"Epoch {epoch} validation metrics: {validation_metrics}")
+
+            wandb.log({"val/loss": validation_metrics["loss"],
+                       "val/fid": final_fid_score,
+                       "val/inception_mean": validation_metrics["inception_score_mean"],
+                       "val/inception_std": validation_metrics["inception_score_std"],
+                       "val/imagebind_sim": validation_metrics["imagebind_sim"]}, step=epoch)
+
             if final_fid_score < best_fid or best_fid == 0:
                 best_fid = final_fid_score
                 print("New best fid: ", best_fid)
@@ -296,6 +301,7 @@ def train(
             accelerator.save_state(f"model_epoch_{epoch}.pt")
             print(f"Model saved at epoch {epoch}")
 
+    wandb.finish()
 
 def freeze_model(model):
     for p in model.parameters():
