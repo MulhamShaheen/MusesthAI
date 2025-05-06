@@ -197,29 +197,19 @@ def val_loop(model, processor, projection, val_dataloader, metrics: dict = None,
             inception_score.update(visual_img)
 
 
-        val_res = {
-            "loss": sumloss / num_batches if num_batches > 0 else 0,
-            "num_batches": num_batches,
-            # mock values
-            "imagebind_sim": 0,
-        }
-
-        try:
-            val_res["fid"] = metrics["fid"].compute()
-            val_res["inception_score_mean"], val_res["inception_score_std"] = metrics["inception_score"].compute()
-        except RuntimeError as e:
-            val_res["fid"] = 0
-            val_res["inception_score_mean"], val_res["inception_score_std"] = 0, 0
-
-        return val_res
-
-
     val_res = {
         "loss": sumloss / num_batches if num_batches > 0 else 0,
         "num_batches": num_batches,
         # mock values
         "imagebind_sim": 0,
     }
+
+    try:
+        val_res["fid"] = fid.compute()
+        val_res["inception_score_mean"], val_res["inception_score_std"] = inception_score.compute()
+    except RuntimeError as e:
+        val_res["fid"] = 0
+        val_res["inception_score_mean"], val_res["inception_score_std"] = 0, 0
 
     return val_res
 
