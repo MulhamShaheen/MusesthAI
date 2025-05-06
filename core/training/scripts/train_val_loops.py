@@ -74,7 +74,8 @@ def get_collate_fn(gen_model: MultiModalityCausalLM):
     return collate_fn
 
 
-def train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch, criterion, train_config):
+def train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch, criterion, train_config,
+               mock_run: bool = False):
     model.eval()
     projection.train()
     progress_bar = tqdm(range(len(train_dataloader)), desc=f"Epoch {epoch}")
@@ -86,9 +87,13 @@ def train_loop(accelerator, model, projection, optimizer, train_dataloader, epoc
             image_ids = batch["image_ids"]
 
             input_embeds = torch.concat([audio_input, image_gen_embeds], dim=1)
-            outputs = model.language_model.model(inputs_embeds=input_embeds, use_cache=False, past_key_values=None,
-                                                 decoder_input_ids=1)
-            hidden_states = outputs.last_hidden_state
+            if mock_run:
+                hidden_states = torch.rand(input_embeds.shape).cuda().to(torch.bfloat16)
+            else:
+                outputs = model.language_model.model(inputs_embeds=input_embeds, use_cache=False, past_key_values=None,
+                                                     decoder_input_ids=1)
+                hidden_states = outputs.last_hidden_state
+
             logits = model.gen_head(hidden_states)
             logits = logits.permute(0, 2, 1)
             loss = criterion(logits[:, :, -576:], image_ids)
@@ -103,7 +108,7 @@ def train_loop(accelerator, model, projection, optimizer, train_dataloader, epoc
 
 @torch.no_grad()
 def val_loop(model, processor, projection, val_dataloader, metrics: dict = None, epoch=1, no_loss=False,
-             generate_freq=0):
+             generate_freq=0, mock_run: bool = False):
     criterion = nn.CrossEntropyLoss(ignore_index=processor.pad_id)
     sumloss = 0
     num_batches = 0
@@ -134,9 +139,12 @@ def val_loop(model, processor, projection, val_dataloader, metrics: dict = None,
         input_embeds = torch.concat([music_embedding, image_gen_embeds], dim=1)
 
         if not no_loss:
-            outputs = model.language_model.model(inputs_embeds=input_embeds, use_cache=False, past_key_values=None,
-                                                 decoder_input_ids=1)
-            hidden_states = outputs.last_hidden_state
+            if mock_run:
+                hidden_states = torch.rand(input_embeds.shape).cuda().to(torch.bfloat16)
+            else:
+                outputs = model.language_model.model(inputs_embeds=input_embeds, use_cache=False, past_key_values=None,
+                                                     decoder_input_ids=1)
+                hidden_states = outputs.last_hidden_state
             logits = model.gen_head(hidden_states)
             logits = logits.permute(0, 2, 1)
             loss = criterion(logits[:, :, -576:].cpu(), batch_input_ids.cpu())
@@ -162,9 +170,13 @@ def val_loop(model, processor, projection, val_dataloader, metrics: dict = None,
             generated_tokens = torch.zeros((parallel_size, batch_input_ids.shape[-1]), dtype=torch.int).cuda()
             inputs_embeds = gen_input_embeds
             for i in range(batch_input_ids.shape[-1]):
-                outputs = model.language_model.model(inputs_embeds=inputs_embeds, use_cache=True,
-                                                     past_key_values=outputs.past_key_values if i != 0 else None)
-                hidden_states = outputs.last_hidden_state
+                if mock_run:
+                    hidden_states = torch.rand(input_embeds.shape).cuda().to(torch.bfloat16)
+                else:
+                    outputs = model.language_model.model(inputs_embeds=inputs_embeds, use_cache=True,
+                                                         past_key_values=outputs.past_key_values if i != 0 else None)
+                    hidden_states = outputs.last_hidden_state
+
                 logits = model.gen_head(hidden_states[:, -1, :])
                 logit_cond = logits[0::2, :]
                 logit_uncond = logits[1::2, :]
