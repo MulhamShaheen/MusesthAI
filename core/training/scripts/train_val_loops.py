@@ -57,7 +57,7 @@ def get_collate_fn(gen_model: MultiModalityCausalLM):
         with torch.no_grad():
             images = torch.cat([item["image"] for item in items], dim=0)
             quant, _, info = gen_model.gen_vision_model.encode(
-                images.squeeze(0).to(dtype=torch.bfloat16).cuda())
+                images.to(dtype=torch.bfloat16).cuda())
             B, C, Hq, Wq = quant.shape
             _, _, min_encoding_indices = info
             image_ids = min_encoding_indices.view(B, Hq * Wq)
@@ -97,7 +97,7 @@ def train_loop(accelerator, model, projection, optimizer, train_dataloader, epoc
             progress_bar.update(1)
             progress_bar.set_description(f'Epoch={epoch} Loss={loss.item():.3f}')
 
-            return
+    return
 
 
 @torch.no_grad()
@@ -194,20 +194,29 @@ def val_loop(model, processor, projection, val_dataloader, metrics: dict = None,
 
             fid.update(target_images, real=True)
             fid.update(visual_img, real=False)
-            fid.update(target_images, real=True)
-            fid.update(visual_img, real=False)
-            inception_score.update(visual_img)
             inception_score.update(visual_img)
 
-        final_fid_score = fid.compute()
-        final_is_mean, final_is_std = inception_score.compute()
+
+        val_res = {
+            "loss": sumloss / num_batches if num_batches > 0 else 0,
+            "num_batches": num_batches,
+            # mock values
+            "imagebind_sim": 0,
+        }
+
+        try:
+            val_res["fid"] = metrics["fid"].compute()
+            val_res["inception_score_mean"], val_res["inception_score_std"] = metrics["inception_score"].compute()
+        except RuntimeError as e:
+            val_res["fid"] = 0
+            val_res["inception_score_mean"], val_res["inception_score_std"] = 0, 0
+
+        return val_res
+
 
     val_res = {
         "loss": sumloss / num_batches if num_batches > 0 else 0,
         "num_batches": num_batches,
-        "fid": final_fid_score,
-        "is_mean": final_is_mean,
-        "is_std": final_is_std,
         # mock values
         "imagebind_sim": 0,
     }
@@ -219,8 +228,8 @@ class TrainConfig:
     log_level = "DEBUG"
 
     num_epochs = 1
-    train_batch_size = 2
-    val_batch_size = 1
+    train_batch_size = 40
+    val_batch_size = 10
     log_grad_norm = True
     learning_rate = 1e-4
     gradient_accumulation_steps = 1
@@ -236,7 +245,7 @@ class TrainConfig:
 
     # Data
     few_train_samples = None
-    few_val_samples = 100
+    few_val_samples = 10
     dataloader_num_workers = 0
 
     train_dataset_path = ""
@@ -269,7 +278,7 @@ def train(
                                                                                          val_dataloader)
 
     metrics = {
-        "fit": FrechetInceptionDistance(feature=2048).to(model.device),
+        "fid": FrechetInceptionDistance(feature=2048).to(model.device),
         "inception_score": InceptionScore(feature='logits_unbiased', splits=10).to(model.device)
     }
 
@@ -278,15 +287,24 @@ def train(
                    train_config=train_config)
 
         if epoch % train_config.evaluate_every_epoch_mod == 0:
+            print("Evaluating model for epoch: ", epoch)
             validation_metrics = val_loop(model, processor, projection, val_dataloader, epoch=epoch, metrics=metrics,
                                           generate_freq=1)
 
-            last_fid = validation_metrics['fid']
-            # metric_logger.log(validation_metrics)
+            final_fid_score = metrics["fid"].compute()
+            final_is_mean, final_is_std =  metrics["inception_score"].compute()
+            validation_metrics["fid"] = final_fid_score
+            validation_metrics["is_mean"] = final_is_mean
+            validation_metrics["is_std"] = final_is_std
+
             print(f"Epoch {epoch} validation metrics: {validation_metrics}")
-            if last_fid < best_fid or best_fid == 0:
-                best_fid = last_fid
+            if final_fid_score < best_fid or best_fid == 0:
+                best_fid = final_fid_score
                 print("New best fid: ", best_fid)
+
+        if epoch % train_config.save_model_every_epoch_mod == 0:
+            accelerator.save_state(f"model_epoch_{epoch}.pt")
+            print(f"Model saved at epoch {epoch}")
 
 
 def freeze_model(model):
@@ -309,13 +327,14 @@ if __name__ == "__main__":
     matched_df_path = os.path.join(os.getcwd(), "data/matched_dataset_concat.pkl")
     matched_df = pd.read_pickle(matched_df_path)
     dataset = ImageAudioDataset(matched_df)
+    val_dataset = ImageAudioDataset(matched_df.sample(n=10, random_state=42))
 
     # Dataloaders
-    train_dataloader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=get_collate_fn(vl_gpt))
-    val_dataloader = DataLoader(dataset, batch_size=2, shuffle=False, collate_fn=get_collate_fn(vl_gpt))
+    train_dataloader = DataLoader(dataset, batch_size=TrainConfig.train_batch_size, shuffle=True, collate_fn=get_collate_fn(vl_gpt))
+    val_dataloader = DataLoader(val_dataset, batch_size=TrainConfig.val_batch_size, shuffle=False, collate_fn=get_collate_fn(vl_gpt))
 
     # Projection model
-    projection = AudioProjection(1024, 2048, scale_factor=2).cuda()
+    projection = AudioProjection(1024, 2048, scale_factor=2, sequal_len=256).cuda()
 
     train(
         model=vl_gpt,
