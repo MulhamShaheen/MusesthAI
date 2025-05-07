@@ -75,10 +75,12 @@ def get_collate_fn(gen_model: MultiModalityCausalLM):
 
 
 def train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch, criterion, train_config,
+               metric_logger: wandb.sdk.wandb_run.Run,
                mock_run: bool = False):
     model.eval()
     projection.train()
     progress_bar = tqdm(range(len(train_dataloader)), desc=f"Epoch {epoch}")
+    total_loss = 0
     for batch in train_dataloader:
         with accelerator.accumulate(projection):
             music_embedding = batch["music_embedding"].to(model.device)
@@ -97,13 +99,18 @@ def train_loop(accelerator, model, projection, optimizer, train_dataloader, epoc
             logits = model.gen_head(hidden_states)
             logits = logits.permute(0, 2, 1)
             loss = criterion(logits[:, :, -576:], image_ids)
+            total_loss += loss.item()
+            step_metrics = {"train_loss": loss.item(), "epoch": epoch}
+            metric_logger.log(step_metrics)
+
             model.zero_grad()
             accelerator.backward(loss)
             optimizer.step()
             progress_bar.update(1)
             progress_bar.set_description(f'Epoch={epoch} Loss={loss.item():.3f}')
 
-    return
+    average_loss = total_loss / len(train_dataloader)
+    return average_loss
 
 
 @torch.no_grad()
@@ -197,6 +204,15 @@ def val_loop(model, processor, projection, val_dataloader, metrics: dict = None,
             dec = dec.to(torch.float32)
             dec = torch.clamp((dec + 1) / 2 * 255, min=0, max=255)
 
+            visual_img = dec.cpu().numpy().transpose(0, 2, 3, 1).astype(np.uint8)
+
+            os.makedirs('generated_samples', exist_ok=True)
+            for i in range(parallel_size):
+                save_path = os.path.join('generated_samples', "img_{}_epoch_{}_batch_{}.jpg".format(i, epoch,
+                                                                                                    num_batches))
+
+                Image.fromarray(visual_img[i]).save(save_path)
+
             visual_img = dec.to(torch.uint8)
             target_images = batch["images"].cuda()
 
@@ -226,36 +242,31 @@ def val_loop(model, processor, projection, val_dataloader, metrics: dict = None,
 
     return val_res
 
-
 class TrainConfig:
     log_level = "DEBUG"
 
     num_epochs = 2
-    train_batch_size = 40
+    train_batch_size = 20
     val_batch_size = 5
     log_grad_norm = True
     learning_rate = 1e-4
     gradient_accumulation_steps = 1
 
-    evaluate_every_epoch_mod = 4
+    evaluate_every_epoch_mod = 1
     save_model_every_epoch_mod = 1
     device = "cuda:0"
 
-    # Model
-
     # Projector
     projector_input_dim = 1024
+    proj_seq_len = 128
 
-    # Data
-    few_train_samples = None
-    few_val_samples = 10
+    few_val_samples = 20
     dataloader_num_workers = 0
 
-    train_dataset_path = ""
-    audio_embeds_train_prefix = ""
-
-    val_dataset_path = ""
-    audio_embeds_val_prefix = ""
+    @classmethod
+    def get_attributes(cls):
+        return {key: value for key, value in cls.__dict__.items() if not key.startswith("__") and not callable(value)
+                and key != "get_attributes"}
 
 
 def train(
@@ -265,12 +276,12 @@ def train(
         train_dataloader: DataLoader,
         val_dataloader: DataLoader,
         train_config: TrainConfig,
+        metric_logger: wandb.sdk.wandb_run.Run,
         device_placement=True,
         mock_run: bool = False,
 ):
     best_fid = 0
-    wandb.init(project="mususthai-training")
-    wandb.config.update(train_config.__dict__)
+    metric_logger
 
     trainable_parameters = list(projection.parameters())
     optimizer = Adam(trainable_parameters, lr=train_config.learning_rate)
@@ -279,19 +290,24 @@ def train(
     accelerator = accelerate.Accelerator(device_placement=device_placement, log_with="wandb")
     accelerator.gradient_accumulation_steps = train_config.gradient_accumulation_steps
 
-    model, projection, optimizer, train_dataloader, val_dataloader = accelerator.prepare(model, projection, optimizer,
+    projection, optimizer, train_dataloader, val_dataloader = accelerator.prepare(projection, optimizer,
                                                                                          train_dataloader,
                                                                                          val_dataloader)
 
     metrics = {
-        "fid": FrechetInceptionDistance(feature=2048).to(model.device),
+        "fid": FrechetInceptionDistance(feature=192).to(model.device),
         "inception_score": InceptionScore(feature='logits_unbiased', splits=10).to(model.device)
     }
 
     for epoch in range(train_config.num_epochs):
-        train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch=epoch, criterion=criterion,
-                   train_config=train_config, mock_run=mock_run)
-        wandb.log({"train/loss": train_loss}, step=epoch)
+        train_loss = train_loop(accelerator, model, projection, optimizer, train_dataloader, epoch=epoch, criterion=criterion,
+                   train_config=train_config, mock_run=mock_run, metric_logger=metric_logger)
+
+        wandb.log({"train/batch_loss": train_loss}, step=epoch)
+        if epoch % train_config.save_model_every_epoch_mod == 0:
+            accelerator.save_state(f"proj_seq_{TrainConfig.proj_seq_len}_epoch_{epoch}.pt")
+            wandb.save(f"model_epoch_{epoch}.pt/pytorch_model_0.pt")
+            print(f"Model saved at epoch {epoch}")
 
         if epoch % train_config.evaluate_every_epoch_mod == 0:
             print("Evaluating model for epoch: ", epoch)
@@ -300,21 +316,12 @@ def train(
             final_fid_score = validation_metrics["fid"]
             print(f"Epoch {epoch} validation metrics: {validation_metrics}")
 
-            wandb.log({"val/loss": validation_metrics["loss"],
-                       "val/fid": final_fid_score,
-                       "val/inception_mean": validation_metrics["inception_score_mean"],
-                       "val/inception_std": validation_metrics["inception_score_std"],
-                       "val/imagebind_sim": validation_metrics["imagebind_sim"]}, step=epoch)
+            metric_logger.log(validation_metrics)
 
             if final_fid_score < best_fid or best_fid == 0:
                 best_fid = final_fid_score
                 print("New best fid: ", best_fid)
 
-        if epoch % train_config.save_model_every_epoch_mod == 0:
-            accelerator.save_state(f"model_epoch_{epoch}.pt")
-            print(f"Model saved at epoch {epoch}")
-
-    wandb.finish()
 
 def freeze_model(model):
     for p in model.parameters():
@@ -323,7 +330,7 @@ def freeze_model(model):
 
 
 if __name__ == "__main__":
-    # Example usage
+    print(TrainConfig.get_attributes())
     model_path = "deepseek-ai/Janus-Pro-1B"
     vl_chat_processor = VLChatProcessor.from_pretrained(model_path)
     vl_gpt = MultiModalityCausalLM.from_pretrained(model_path, trust_remote_code=True).to(torch.bfloat16).cuda().eval()
@@ -336,21 +343,23 @@ if __name__ == "__main__":
     matched_df_path = os.path.join(os.getcwd(), "data/matched_dataset_concat.pkl")
     matched_df = pd.read_pickle(matched_df_path)
     dataset = ImageAudioDataset(matched_df)
-    val_dataset = ImageAudioDataset(matched_df.sample(n=10, random_state=42))
+    val_dataset = ImageAudioDataset(matched_df.sample(n=TrainConfig.few_val_samples, random_state=42))
 
     # Dataloaders
     train_dataloader = DataLoader(dataset, batch_size=TrainConfig.train_batch_size, shuffle=True, collate_fn=get_collate_fn(vl_gpt))
     val_dataloader = DataLoader(val_dataset, batch_size=TrainConfig.val_batch_size, shuffle=False, collate_fn=get_collate_fn(vl_gpt))
 
     # Projection model
-    projection = AudioProjection(1024, 2048, scale_factor=2, sequal_len=256).cuda()
+    projection = AudioProjection(1024, 2048, scale_factor=2, sequal_len=TrainConfig.proj_seq_len).cuda()
 
-    train(
-        model=vl_gpt,
-        projection=projection,
-        processor=vl_chat_processor,
-        train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
-        train_config=TrainConfig,
-        mock_run=True,
-    )
+    with wandb.init(project="musesthai", config=TrainConfig.get_attributes()) as metric_logger:
+        train(
+            model=vl_gpt,
+            projection=projection,
+            processor=vl_chat_processor,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            train_config=TrainConfig,
+            mock_run=False,
+            metric_logger=metric_logger
+        )
