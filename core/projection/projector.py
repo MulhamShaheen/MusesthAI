@@ -45,6 +45,7 @@ class ImprovedAudioProjection(nn.Module):
         for i in range(num_layers):
             out_dim_layer = output_dim if i == num_layers - 1 else 2 * output_dim # Example: intermediate layer has higher dim
             self.projection_layers.append(nn.Linear(in_dim, out_dim_layer))
+            self.projection_layers.append(nn.LayerNorm(out_dim_layer))
             if i < num_layers - 1:
                 self.projection_layers.append(self.activation)
                 self.projection_layers.append(nn.Dropout(dropout))
