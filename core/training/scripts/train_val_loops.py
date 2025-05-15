@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 from PIL import Image
 from torchvision.transforms import ToTensor
 from accelerate import Accelerator
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from Janus.janus.models import MultiModalityCausalLM, VLChatProcessor
 from core.projection import AudioProjection
 import wandb
@@ -23,14 +23,14 @@ from core.projection.projector import ImprovedAudioProjection
 wandb.login(key="af7a0ee3c846dd80ff62ec27a2046eb9b809b646")
 
 
-def generate_sample(music_embedding, batched_prompt_embeds, image_token_num_per_image, processor, model, file_prefix):
+def generate_sample(music_embedding, batched_prompt_embeds, image_start_embeds, image_token_num_per_image, processor, model, file_prefix):
     cfg_weight = 5
     temperature = 1
     img_size = 384
     patch_size = 16
 
     parallel_size = music_embedding.shape[0]
-    conditional_embeds = torch.concat([music_embedding, batched_prompt_embeds], dim=1)
+    conditional_embeds = torch.concat([music_embedding, batched_prompt_embeds, image_start_embeds], dim=1)
     unconditional_tokens = torch.zeros((1, conditional_embeds.shape[-2]), dtype=torch.int).cuda()
     unconditional_tokens[0, 1:-1] = processor.pad_id
     unconditional_embeds = model.language_model.get_input_embeddings()(unconditional_tokens)
@@ -82,25 +82,6 @@ def generate_sample(music_embedding, batched_prompt_embeds, image_token_num_per_
     return visual_img
 
 
-def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int) -> torch.LongTensor:
-    """
-    Shifts input_ids one token to the right, prepending the decoder_start_token_id.
-    This is a common way to create decoder_input_ids for teacher-forcing.
-    """
-    if not isinstance(input_ids, torch.Tensor):
-        raise TypeError("input_ids should be a torch.Tensor")
-    if not isinstance(pad_token_id, int):
-        raise TypeError("pad_token_id should be an int")
-    if not isinstance(decoder_start_token_id, int):
-        raise TypeError("decoder_start_token_id should be an int")
-
-    shifted_input_ids = torch.full_like(input_ids, pad_token_id)
-    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
-    shifted_input_ids[:, 0] = decoder_start_token_id
-
-    return shifted_input_ids.to(torch.long)
-
-
 class ImageAudioDataset(Dataset):
     def __init__(self, dataframe, transform=None):
         self.dataframe = dataframe
@@ -148,22 +129,42 @@ def get_collate_fn(gen_model: MultiModalityCausalLM):
             B, C, Hq, Wq = quant.shape
             _, _, min_encoding_indices = info
             image_ids = min_encoding_indices.view(B, Hq * Wq)
-            shifted_image_ids = shift_tokens_right(image_ids, 0, 1).cuda()
             gen_embeds = gen_model.prepare_gen_img_embeds(image_ids)
 
         result["image_ids"] = image_ids.squeeze(-1)
         result["image_gen_embeds"] = gen_embeds
         result["music_embedding"] = torch.stack([torch.from_numpy(item["music_embedding"]) for item in items], dim=0)
         result["images"] = images
+        result["audio_paths"] = [item["audio_path"] for item in items]
 
         return result
 
     return collate_fn
 
 
+def post_process_batch(gen_model, batch):
+    result = dict()
+    with torch.no_grad():
+        images = torch.cat([image for image in batch["image"]], dim=0)
+        quant, _, info = gen_model.gen_vision_model.encode(
+            images.to(dtype=torch.bfloat16).cuda())
+        B, C, Hq, Wq = quant.shape
+        _, _, min_encoding_indices = info
+        image_ids = min_encoding_indices.view(B, Hq * Wq)
+        gen_embeds = gen_model.prepare_gen_img_embeds(image_ids)
+
+    result["image_ids"] = image_ids.squeeze(-1)
+    result["image_gen_embeds"] = gen_embeds
+    result["music_embedding"] = torch.stack([item for item in batch["music_embedding"]], dim=0)
+    result["images"] = images
+    result["audio_paths"] = [item for item in batch["audio_path"]]
+
+    return result
+
+
 def train_loop(accelerator, model, processor, projection, optimizer, train_dataloader, epoch, criterion, train_config,
                metric_logger: wandb.sdk.wandb_run.Run,
-               mock_run: bool = False, generate_freq=20):
+               mock_run: bool = False, generate_freq=20, metrics: dict = None,):
     model.eval()
     projection.train()
     progress_bar = tqdm(range(len(train_dataloader)), desc=f"Epoch {epoch}")
@@ -175,7 +176,7 @@ def train_loop(accelerator, model, processor, projection, optimizer, train_datal
         conversation = [
             {
                 "role": "User",
-                "content":train_config.sys_prompt,
+                "content": train_config.sys_prompt,
             },
             {"role": "Assistant", "content": ""},
         ]
@@ -185,88 +186,108 @@ def train_loop(accelerator, model, processor, projection, optimizer, train_datal
             sft_format=processor.sft_format,
             system_prompt="",
         )
-        prompt = sft_format + processor.image_start_tag
+        prompt = sft_format
 
         prompt_ids = processor.tokenizer.encode(prompt)
         prompt_ids = torch.LongTensor(prompt_ids).cuda()
         prompt_embeds = model.language_model.get_input_embeddings()(prompt_ids).to(torch.bfloat16).unsqueeze(0)
 
+    image_start_tag_ids = processor.tokenizer.encode(processor.image_start_tag)
+    image_start_tag_ids = torch.LongTensor(image_start_tag_ids).cuda()
+    image_start_embeds = model.language_model.get_input_embeddings()(image_start_tag_ids).to(
+        torch.bfloat16).unsqueeze(0)
+
     for batch in train_dataloader:
+        batch = post_process_batch(model, batch)
+
         with accelerator.accumulate(projection):
             music_embedding = batch["music_embedding"].to(model.device)
             audio_input = projection(music_embedding).to(torch.bfloat16)
             B = audio_input.shape[0]
 
-            audio_input_float = audio_input.to(torch.float32).detach()
-
-            audio_input_mean = torch.mean(audio_input_float).item()
-            audio_input_std = torch.std(audio_input_float).item()
-            audio_input_norm = torch.linalg.norm(audio_input_float, 'fro', dim=(-2, -1)).mean().item()
-
-            audio_attention_mask = torch.ones(B, audio_input.shape[1], dtype=torch.long).cuda()
 
             image_ids = batch["image_ids"]
             image_gen_embeds = batch["image_gen_embeds"].to(torch.bfloat16)
-            image_attention_mask = torch.ones(B, image_gen_embeds.shape[1], dtype=torch.long).cuda()
-            image_attention_mask[:, 0] = 0
 
+            batched_image_start_embeds = image_start_embeds.repeat(B, 1, 1)
             if prompt_embeds is not None:
                 batched_prompt_embeds = prompt_embeds.repeat(B, 1, 1)
-                prompt_attention_mask = torch.ones(B, batched_prompt_embeds.shape[1], dtype=torch.long).cuda()
-                input_embeds = torch.concat([audio_input, batched_prompt_embeds, image_gen_embeds], dim=1)
-                attention_mask = torch.concat([prompt_attention_mask, audio_attention_mask, image_attention_mask],
-                                              dim=1)
-
-                prompt_embeds_mean = torch.mean(prompt_embeds.float()).item()
-                prompt_embeds_std = torch.std(prompt_embeds.float()).item()
+                input_embeds = torch.concat(
+                    [batched_prompt_embeds, audio_input, image_gen_embeds], dim=1)
 
             else:
                 input_embeds = torch.concat([audio_input, image_gen_embeds], dim=1)
-                attention_mask = torch.concat([audio_attention_mask, image_attention_mask], dim=1)
 
             if mock_run:
                 hidden_states = torch.rand(input_embeds.shape).cuda().to(torch.bfloat16)
             else:
-                outputs = model.language_model.model(inputs_embeds=input_embeds, use_cache=False, past_key_values=None,
-                                                     attention_mask=attention_mask if train_config.casual_mask else None)
+                outputs = model.language_model.model(inputs_embeds=input_embeds, use_cache=False, past_key_values=None)
                 hidden_states = outputs.last_hidden_state
 
             logits = model.gen_head(hidden_states)
-            logits_norm = torch.linalg.norm(logits.float(), 'fro', dim=(-2, -1)).mean()
 
-            logits = logits.permute(0, 2, 1)
-            # loss = criterion(logits[:, -576:-1,:].flatten(0,1), image_ids[:,1:,:].flatten(0,1))
-            loss = criterion(logits[:, -576:-1,:].flatten(0,1), image_ids[:,1:,:].flatten(0,1))
-            # [i+1, i+2, ..., i+]
+            loss = criterion(logits[:, -576:-1, :].flatten(0, 1), image_ids[:, 1:].flatten(0, 1))
+
             total_loss += loss.item()
             step_metrics = {
                 "train_loss": loss.item(),
                 "epoch": epoch,
-                "logits_norm": logits_norm.item(),
-                "audio_input_mean": audio_input_mean,
-                "audio_input_std": audio_input_std,
-                "audio_input_norm": audio_input_norm,
             }
 
-            if prompt_embeds is not None:
-                step_metrics["prompt_embeds_mean"] = prompt_embeds_mean
-                step_metrics["prompt_embeds_std"] = prompt_embeds_std
-
-            model.zero_grad()
+            # model.zero_grad()
+            # projection.zero_grad()
             accelerator.backward(loss)
             optimizer.step()
+            optimizer.zero_grad()
 
         if num_batches % generate_freq == 0:
             image_token_num = image_ids.shape[-1]
             rand_index = random.randint(0, audio_input.shape[0] - 1)
             audio_sample = audio_input[rand_index].unsqueeze(0)
-            prompt_sample = batched_prompt_embeds[rand_index].unsqueeze(0)
+            if prompt_embeds is not None:
+                prompt_sample = batched_prompt_embeds[rand_index].unsqueeze(0)
+            else:
+                prompt_sample = None
+            audio_input_float = audio_input.to(torch.float32).detach()
+
+            audio_input_norm = torch.linalg.norm(audio_input_float, 'fro', dim=(-2, -1)).mean().item()
+            text_input_norm = torch.linalg.norm(batched_prompt_embeds.float(), 'fro', dim=(-2, -1)).mean().item()
+
             with torch.no_grad():
-                visual_img = generate_sample(audio_sample, prompt_sample, image_token_num, processor, model,
+                visual_img = generate_sample(prompt_sample, audio_sample, image_start_embeds,
+                                             image_token_num, processor, model,
                                              file_prefix=f"train_epoch_{epoch}_batch_{num_batches}")
 
-            wandb_image = wandb.Image(visual_img[0], caption=f"Epoch {epoch}, batch: {num_batches}, loss: {step_metrics['train_loss']}")
+            wandb_image = wandb.Image(visual_img[0], caption=f"Epoch {epoch}, batch: {num_batches}, "
+                                                             f"loss: {step_metrics['train_loss']} "
+                                                             f"audio: {batch['audio_paths'][rand_index]}")
             step_metrics["Generated Example"] = wandb_image
+            step_metrics["audio_input_norm"] = audio_input_norm
+            step_metrics["text_input_norm"] = text_input_norm
+
+            target_images = batch["images"].cuda()
+
+            if target_images.dtype != torch.uint8:
+                target_images = (target_images * 255.0).to(torch.uint8)
+            if target_images.shape[1] != 3:
+                target_images = target_images.permute(0, 3, 1, 2)
+
+            if metrics is not None:
+                if "fid" in metrics:
+                    metrics["fid"].update(target_images, real=True)
+                    metrics["fid"].update(visual_img, real=False)
+                    try:
+                        step_metrics["fid"] = metrics["fid"].compute().item()
+                    except:
+                        pass
+                if "inception_score" in metrics:
+                    metrics["inception_score"].update(visual_img)
+                    try:
+                        step_metrics["inception_score_mean"], step_metrics[
+                            "inception_score_std"] = inception_score.compute().item()
+                    except:
+                        pass
+
         num_batches += 1
         progress_bar.update(1)
         progress_bar.set_description(f'Epoch={epoch} Loss={loss.item():.3f}')
@@ -278,7 +299,7 @@ def train_loop(accelerator, model, processor, projection, optimizer, train_datal
 
 
 @torch.no_grad()
-def val_loop(model, processor, projection, val_dataloader, train_config, metrics: dict = None, epoch=1, no_loss=False,
+def val_loop(model, processor, projection, val_dataloader, train_config, metrics: dict = None, epoch=1, no_loss=True,
              generate_freq=0, mock_run: bool = False):
     criterion = nn.CrossEntropyLoss(ignore_index=processor.pad_id)
     sumloss = 0
@@ -299,11 +320,16 @@ def val_loop(model, processor, projection, val_dataloader, train_config, metrics
             sft_format=processor.sft_format,
             system_prompt="",
         )
-        prompt = sft_format + processor.image_start_tag
+        prompt = sft_format
 
         prompt_ids = processor.tokenizer.encode(prompt)
         prompt_ids = torch.LongTensor(prompt_ids).cuda()
         prompt_embeds = model.language_model.get_input_embeddings()(prompt_ids).to(torch.bfloat16).unsqueeze(0)
+
+    image_start_tag_ids = processor.tokenizer.encode(processor.image_start_tag)
+    image_start_tag_ids = torch.LongTensor(image_start_tag_ids).cuda()
+    image_start_embeds = model.language_model.get_input_embeddings()(image_start_tag_ids).to(
+        torch.bfloat16).unsqueeze(0)
 
     if not metrics:
         fid = FrechetInceptionDistance(feature=2048).to(model.device)
@@ -319,14 +345,22 @@ def val_loop(model, processor, projection, val_dataloader, train_config, metrics
     model.eval()
     projection.eval()
     for batch in tqdm(val_dataloader):
+        batch = post_process_batch(model, batch)
+
         batch_input_ids = batch['image_ids'].to(model.device)
         music_embedding = batch["music_embedding"].to(model.device)
         music_embedding = projection(music_embedding).to(torch.bfloat16)
         image_gen_embeds = batch["image_gen_embeds"].to(model.device).to(torch.bfloat16)
 
+        B = music_embedding.shape[0]
+
+        batched_image_start_embeds = image_start_embeds.repeat(B, 1, 1)
+
         if prompt_embeds is not None:
             batched_prompt_embeds = prompt_embeds.repeat(music_embedding.shape[0], 1, 1)
-            input_embeds = torch.concat([music_embedding, batched_prompt_embeds, image_gen_embeds], dim=1)
+
+            input_embeds = torch.concat(
+                [batched_prompt_embeds, music_embedding, image_gen_embeds], dim=1)
         else:
             input_embeds = torch.concat([music_embedding, image_gen_embeds], dim=1)
 
@@ -337,8 +371,8 @@ def val_loop(model, processor, projection, val_dataloader, train_config, metrics
                 outputs = model.language_model.model(inputs_embeds=input_embeds, use_cache=False, past_key_values=None)
                 hidden_states = outputs.last_hidden_state
             logits = model.gen_head(hidden_states)
-            logits = logits.permute(0, 2, 1)
-            loss = criterion(logits[:, :, -576:].cpu(), batch_input_ids.cpu())
+
+            loss = criterion(logits[:, -576:-1, :].flatten(0, 1), batch_input_ids[:, 1:].flatten(0, 1))
             sumloss += loss.item()
 
         num_batches += 1
@@ -346,8 +380,15 @@ def val_loop(model, processor, projection, val_dataloader, train_config, metrics
         # generate images and metrics
         if num_batches % generate_freq == 0:
             image_token_num = batch_input_ids.shape[-1]
-            visual_img = generate_sample(music_embedding, batched_prompt_embeds, image_token_num, processor, model,
-                            file_prefix=f"epoch_{epoch}_batch_{num_batches}")
+            with torch.no_grad():
+                visual_img = generate_sample(batched_prompt_embeds, music_embedding, batched_image_start_embeds,
+                                             image_token_num, processor, model,
+                                             file_prefix=f"epoch_{epoch}_batch_{num_batches}")
+
+            wandb_image = wandb.Image(visual_img[0], caption=f"Epoch {epoch}, batch: {num_batches}, "
+                                                             f"loss: {step_metrics['train_loss']} "
+                                                             f"audio: {batch['audio_paths'][rand_index]}")
+            step_metrics["Generated Example Val"] = wandb_image
 
             target_images = batch["images"].cuda()
 
@@ -384,32 +425,34 @@ def val_loop(model, processor, projection, val_dataloader, train_config, metrics
 class TrainConfig:
     log_level = "DEBUG"
 
-    num_epochs = 5
-    train_batch_size = 50
+    num_epochs = 30
+    train_batch_size = 60
     val_batch_size = 5
     log_grad_norm = True
-    learning_rate = 3e-5
+    learning_rate = 1e-4
     gradient_accumulation_steps = 1
 
-    evaluate_every_epoch_mod = 1
-    train_evaluate_every_batch_mod = 10
-    save_model_every_epoch_mod = 1
+    evaluate_every_epoch_mod = 2
+    save_model_every_epoch_mod = 5
     device = "cuda:0"
 
     projector_input_dim = 1024
     projector_output_dim = 2048
-    proj_seq_len = 16
-    proj_num_layers = 4
+    proj_seq_len = 24
+    proj_num_layers = 3
     proj_dropout = 0.1
     proj_activation = 'gelu'
-    proj_use_l2 = False
+    proj_use_l2 = True
+    proj_scale_up = 1
 
-    few_val_samples = 20
+    gen_freq = 110
+
+    few_val_samples = 100
     dataloader_num_workers = 0
-    dataset_name = "matched_dataset_0_25.pkl"
+    dataset_name = "matched_dataset_0_15.pkl"
 
-    sys_prompt = "Detailed Art that contains abstract figures for different emotions"
-    casual_mask = False
+    sys_prompt = "Detailed art that contains abstract figures"
+    # sys_prompt = None
 
     @classmethod
     def get_attributes(cls):
@@ -431,7 +474,7 @@ def train(
     best_fid = 0
 
     trainable_parameters = list(projection.parameters())
-    optimizer = Adam(trainable_parameters, lr=train_config.learning_rate)
+    optimizer = AdamW(trainable_parameters, lr=train_config.learning_rate)
     criterion = nn.CrossEntropyLoss(ignore_index=processor.image_start_id)
 
     accelerator = accelerate.Accelerator(device_placement=device_placement, log_with="wandb")
@@ -447,9 +490,9 @@ def train(
 
     for epoch in range(train_config.num_epochs):
         train_loss = train_loop(accelerator, model, processor, projection, optimizer, train_dataloader, epoch=epoch,
-                                criterion=criterion,
+                                criterion=criterion, metrics=metrics,
                                 train_config=train_config, mock_run=mock_run, metric_logger=metric_logger,
-                                generate_freq=5)
+                                generate_freq=train_config.gen_freq)
         metric_logger.log({"epoch_loss": train_loss})
         if epoch % train_config.save_model_every_epoch_mod == 0:
             torch.save(projection.state_dict(), f"proj_seq_{TrainConfig.proj_seq_len}_epoch_{epoch}_projection.pt")
@@ -458,10 +501,12 @@ def train(
         if epoch % train_config.evaluate_every_epoch_mod == 0:
             print("Evaluating model for epoch: ", epoch)
             validation_metrics = val_loop(model, processor, projection, val_dataloader, train_config=train_config,
-                                          epoch=epoch, metrics=metrics,
+                                          epoch=epoch, metrics=metrics, no_loss=False,
                                           generate_freq=1, mock_run=mock_run)
             final_fid_score = validation_metrics["fid"]
             print(f"Epoch {epoch} validation metrics: {validation_metrics}")
+
+            validation_metrics = {f"val_{k}":v for k, v in validation_metrics.items()}
 
             metric_logger.log(validation_metrics)
 
@@ -488,7 +533,8 @@ if __name__ == "__main__":
         num_layers=TrainConfig.proj_num_layers,
         dropout=TrainConfig.proj_dropout,
         activation=TrainConfig.proj_activation,
-        use_l2=TrainConfig.proj_use_l2
+        use_l2=TrainConfig.proj_use_l2,
+        scale_up=TrainConfig.proj_scale_up
     ).cuda()
 
     if args.proj_path and os.path.exists(args.proj_path):
@@ -496,9 +542,9 @@ if __name__ == "__main__":
         print(f"Loaded projection model from {args.proj_path}")
 
     print(TrainConfig.get_attributes())
-    model_path = "deepseek-ai/Janus-Pro-1B"
-    vl_chat_processor = VLChatProcessor.from_pretrained(model_path)
-    vl_gpt = MultiModalityCausalLM.from_pretrained(model_path, trust_remote_code=True).to(torch.bfloat16).cuda().eval()
+    model_path = "deepseek-ai/Janus-1.3B"
+    vl_chat_processor = VLChatProcessor.from_pretrained(model_path, use_fast=True)
+    vl_gpt = MultiModalityCausalLM.from_pretrained(model_path, trust_remote_code=True).to(torch.bfloat16).cuda()
 
     freeze_model(vl_gpt)
 
@@ -507,14 +553,21 @@ if __name__ == "__main__":
 
     matched_df_path = os.path.join(os.getcwd(), f"data/{TrainConfig.dataset_name}")
     matched_df = pd.read_pickle(matched_df_path)
-    dataset = ImageAudioDataset(matched_df)
-    val_dataset = ImageAudioDataset(matched_df.sample(n=TrainConfig.few_val_samples, random_state=42))
+    val_df = matched_df.sample(n=TrainConfig.few_val_samples, random_state=42)
+    train_df = matched_df.drop(val_df.index)
+
+    dataset = ImageAudioDataset(train_df)
+    val_dataset = ImageAudioDataset(val_df)
 
     # Dataloaders
     train_dataloader = DataLoader(dataset, batch_size=TrainConfig.train_batch_size, shuffle=True,
-                                  collate_fn=get_collate_fn(vl_gpt))
+                                  num_workers=4, pin_memory=True,
+                                  # collate_fn=get_collate_fn(vl_gpt),
+                                  )
     val_dataloader = DataLoader(val_dataset, batch_size=TrainConfig.val_batch_size, shuffle=False,
-                                collate_fn=get_collate_fn(vl_gpt))
+                                num_workers=4, pin_memory=True,
+                                # collate_fn=get_collate_fn(vl_gpt),
+                                )
 
     # Projection model
     with wandb.init(project="musesthai", config=TrainConfig.get_attributes()) as metric_logger:
