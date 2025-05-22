@@ -26,4 +26,4 @@ with torch.no_grad():
 
     image_ids = image_ids.squeeze(-1)
     shifted_image_ids = JG.shift_image_tokens(image_ids)  # torch.Size([1, 576])
-    loss = cross_entropy(logits[:, :, -image_ids.shape[-1]:], shifted_image_ids, ignore_index=-100)
+    loss = cross_entropy(logits[:, :, -image_ids.shape[-1]:], shifted_image_ids, ignore_index=100003)
