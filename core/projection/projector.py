@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class AudioProjection(nn.Module):
@@ -23,12 +24,14 @@ class AudioProjection(nn.Module):
 
 
 class ImprovedAudioProjection(nn.Module):
-    def __init__(self, input_dim, output_dim, seq_len=32, num_layers=2, dropout=0.1, activation='gelu', use_positional_encoding=True):
+    def __init__(self, input_dim, output_dim, seq_len=32, num_layers=2, dropout=0.1, activation='gelu', use_l2=True,
+                 scale_up: float = 1.0):
         super().__init__()
         self.seq_len = seq_len
         self.output_dim = output_dim
         self.num_layers = num_layers
-        self.use_positional_encoding = use_positional_encoding
+        self.use_l2 = use_l2
+        self.scale_up = scale_up
 
         if activation == 'relu':
             self.activation = nn.ReLU()
@@ -43,7 +46,7 @@ class ImprovedAudioProjection(nn.Module):
         self.projection_layers = nn.ModuleList()
         in_dim = input_dim
         for i in range(num_layers):
-            out_dim_layer = output_dim if i == num_layers - 1 else 2 * output_dim # Example: intermediate layer has higher dim
+            out_dim_layer = output_dim if i == num_layers - 1 else 2 * output_dim
             self.projection_layers.append(nn.Linear(in_dim, out_dim_layer))
             self.projection_layers.append(nn.LayerNorm(out_dim_layer))
             if i < num_layers - 1:
@@ -63,4 +66,6 @@ class ImprovedAudioProjection(nn.Module):
         # Final projection and reshape
         x = self.final_reshape(x)
         x = x.reshape(B, self.seq_len, self.output_dim)
-        return x
+        if self.use_l2:
+            x = F.normalize(x, p = 2, dim = -1)
+        return x * self.scale_up
