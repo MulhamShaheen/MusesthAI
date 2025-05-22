@@ -284,7 +284,7 @@ def train_loop(accelerator, model, processor, projection, optimizer, train_datal
                     metrics["inception_score"].update(visual_img)
                     try:
                         step_metrics["inception_score_mean"], step_metrics[
-                            "inception_score_std"] = inception_score.compute().item()
+                            "inception_score_std"] = metrics["inception_score"].compute().item()
                     except:
                         pass
 
@@ -299,7 +299,9 @@ def train_loop(accelerator, model, processor, projection, optimizer, train_datal
 
 
 @torch.no_grad()
-def val_loop(model, processor, projection, val_dataloader, train_config, metrics: dict = None, epoch=1, no_loss=True,
+def val_loop(model, processor, projection, val_dataloader, train_config,
+             metric_logger: wandb.sdk.wandb_run.Run,
+             metrics: dict = None, epoch=1, no_loss=True,
              generate_freq=0, mock_run: bool = False):
     criterion = nn.CrossEntropyLoss(ignore_index=processor.pad_id)
     sumloss = 0
@@ -377,18 +379,25 @@ def val_loop(model, processor, projection, val_dataloader, train_config, metrics
 
         num_batches += 1
 
-        # generate images and metrics
+        val_res = {
+            "loss": sumloss / num_batches if num_batches > 0 else 0,
+            "num_batches": num_batches,
+            # mock values
+            "imagebind_sim": 0,
+        }
+
         if num_batches % generate_freq == 0:
+            rand_index = random.randint(0, batch_input_ids.shape[0] - 1)
             image_token_num = batch_input_ids.shape[-1]
             with torch.no_grad():
                 visual_img = generate_sample(batched_prompt_embeds, music_embedding, batched_image_start_embeds,
                                              image_token_num, processor, model,
                                              file_prefix=f"epoch_{epoch}_batch_{num_batches}")
-
-            wandb_image = wandb.Image(visual_img[0], caption=f"Epoch {epoch}, batch: {num_batches}, "
-                                                             f"loss: {step_metrics['train_loss']} "
+            wandb_image = wandb.Image(visual_img[rand_index], caption=f"Epoch {epoch}, batch: {num_batches}, "
+                                                             f"loss: {val_res['loss']} "
                                                              f"audio: {batch['audio_paths'][rand_index]}")
-            step_metrics["Generated Example Val"] = wandb_image
+
+
 
             target_images = batch["images"].cuda()
 
@@ -397,27 +406,28 @@ def val_loop(model, processor, projection, val_dataloader, train_config, metrics
             if target_images.shape[1] != 3:
                 target_images = target_images.permute(0, 3, 1, 2)
 
+            wandb_target = wandb.Image(target_images[rand_index].cpu(), caption=f"Epoch {epoch}, batch: {num_batches}, "
+                                                                            f"loss: {val_res['loss']} ")
+            val_res["Generated Example"] = wandb_image
+            val_res["Target Image"] = wandb_target
+
             if fid is not None:
                 fid.update(target_images, real=True)
                 fid.update(visual_img, real=False)
             if inception_score is not None:
                 inception_score.update(visual_img)
 
-    val_res = {
-        "loss": sumloss / num_batches if num_batches > 0 else 0,
-        "num_batches": num_batches,
-        # mock values
-        "imagebind_sim": 0,
-    }
+            try:
+                if fid is not None:
+                    val_res["fid"] = fid.compute()
+                if inception_score is not None:
+                    val_res["inception_score_mean"], val_res["inception_score_std"] = inception_score.compute()
+            except RuntimeError as e:
+                val_res["fid"] = 0
+                val_res["inception_score_mean"], val_res["inception_score_std"] = 0, 0
 
-    try:
-        if fid is not None:
-            val_res["fid"] = fid.compute()
-        if inception_score is not None:
-            val_res["inception_score_mean"], val_res["inception_score_std"] = inception_score.compute()
-    except RuntimeError as e:
-        val_res["fid"] = 0
-        val_res["inception_score_mean"], val_res["inception_score_std"] = 0, 0
+        val_res = {f"val_{k}": v for k, v in val_res.items()}
+        metric_logger.log(val_res)
 
     return val_res
 
@@ -427,12 +437,12 @@ class TrainConfig:
 
     num_epochs = 30
     train_batch_size = 60
-    val_batch_size = 5
+    val_batch_size = 10
     log_grad_norm = True
     learning_rate = 1e-4
     gradient_accumulation_steps = 1
 
-    evaluate_every_epoch_mod = 2
+    evaluate_every_epoch_mod = 3
     save_model_every_epoch_mod = 5
     device = "cuda:0"
 
@@ -443,13 +453,14 @@ class TrainConfig:
     proj_dropout = 0.1
     proj_activation = 'gelu'
     proj_use_l2 = True
-    proj_scale_up = 1
+    proj_scale_up = 3
 
     gen_freq = 110
 
-    few_val_samples = 100
+    few_val_samples = 60
     dataloader_num_workers = 0
     dataset_name = "matched_dataset_0_15.pkl"
+    val_dataset_name = "val_dataset.pkl"
 
     sys_prompt = "Detailed art that contains abstract figures"
     # sys_prompt = None
@@ -501,19 +512,16 @@ def train(
         if epoch % train_config.evaluate_every_epoch_mod == 0:
             print("Evaluating model for epoch: ", epoch)
             validation_metrics = val_loop(model, processor, projection, val_dataloader, train_config=train_config,
-                                          epoch=epoch, metrics=metrics, no_loss=False,
+                                          epoch=epoch, metrics=metrics, no_loss=False, metric_logger=metric_logger,
                                           generate_freq=1, mock_run=mock_run)
             final_fid_score = validation_metrics["fid"]
             print(f"Epoch {epoch} validation metrics: {validation_metrics}")
-
-            validation_metrics = {f"val_{k}":v for k, v in validation_metrics.items()}
-
-            metric_logger.log(validation_metrics)
 
             if final_fid_score < best_fid or best_fid == 0:
                 best_fid = final_fid_score
                 print("New best fid: ", best_fid)
 
+    torch.save(projection.state_dict(), f"proj_seq_{TrainConfig.proj_seq_len}_fid_{best_fid}.pt")
 
 def freeze_model(model):
     for p in model.parameters():
@@ -552,24 +560,18 @@ if __name__ == "__main__":
     import pandas as pd
 
     matched_df_path = os.path.join(os.getcwd(), f"data/{TrainConfig.dataset_name}")
+    val_df_path = os.path.join(os.getcwd(), f"data/{TrainConfig.val_dataset_name}")
     matched_df = pd.read_pickle(matched_df_path)
-    val_df = matched_df.sample(n=TrainConfig.few_val_samples, random_state=42)
-    train_df = matched_df.drop(val_df.index)
+    val_df = pd.read_pickle(val_df_path)
 
-    dataset = ImageAudioDataset(train_df)
+    dataset = ImageAudioDataset(matched_df)
     val_dataset = ImageAudioDataset(val_df)
 
-    # Dataloaders
     train_dataloader = DataLoader(dataset, batch_size=TrainConfig.train_batch_size, shuffle=True,
-                                  num_workers=4, pin_memory=True,
-                                  # collate_fn=get_collate_fn(vl_gpt),
-                                  )
+                                  num_workers=6, pin_memory=True)
     val_dataloader = DataLoader(val_dataset, batch_size=TrainConfig.val_batch_size, shuffle=False,
-                                num_workers=4, pin_memory=True,
-                                # collate_fn=get_collate_fn(vl_gpt),
-                                )
+                                num_workers=6, pin_memory=True)
 
-    # Projection model
     with wandb.init(project="musesthai", config=TrainConfig.get_attributes()) as metric_logger:
         train(
             model=vl_gpt,
