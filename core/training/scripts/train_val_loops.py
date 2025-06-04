@@ -23,7 +23,8 @@ from core.projection.projector import ImprovedAudioProjection
 wandb.login(key="af7a0ee3c846dd80ff62ec27a2046eb9b809b646")
 
 
-def generate_sample(music_embedding, batched_prompt_embeds, image_start_embeds, image_token_num_per_image, processor, model, file_prefix):
+def generate_sample(music_embedding, batched_prompt_embeds, image_start_embeds, image_token_num_per_image, processor,
+                    model, file_prefix):
     cfg_weight = 5
     temperature = 1
     img_size = 384
@@ -71,12 +72,12 @@ def generate_sample(music_embedding, batched_prompt_embeds, image_start_embeds, 
     dec = dec.to(torch.float32)
     dec = torch.clamp((dec + 1) / 2 * 255, min=0, max=255)
 
-    visual_img = dec.cpu().numpy().transpose(0, 2, 3, 1).astype(np.uint8)
+    # visual_img = dec.cpu().numpy().transpose(0, 2, 3, 1).astype(np.uint8)
 
-    os.makedirs('generated_samples', exist_ok=True)
-    for i in range(parallel_size):
-        save_path = os.path.join('generated_samples', "{}_{}.jpg".format(file_prefix, i))
-        Image.fromarray(visual_img[i]).save(save_path)
+    # os.makedirs('generated_samples', exist_ok=True)
+    # for i in range(parallel_size):
+    #     save_path = os.path.join('generated_samples', "{}_{}.jpg".format(file_prefix, i))
+    #     Image.fromarray(visual_img[i]).save(save_path)
 
     visual_img = dec.to(torch.uint8)
     return visual_img
@@ -164,7 +165,7 @@ def post_process_batch(gen_model, batch):
 
 def train_loop(accelerator, model, processor, projection, optimizer, train_dataloader, epoch, criterion, train_config,
                metric_logger: wandb.sdk.wandb_run.Run,
-               mock_run: bool = False, generate_freq=20, metrics: dict = None,):
+               mock_run: bool = False, generate_freq=20, metrics: dict = None, ):
     model.eval()
     projection.train()
     progress_bar = tqdm(range(len(train_dataloader)), desc=f"Epoch {epoch}")
@@ -204,7 +205,6 @@ def train_loop(accelerator, model, processor, projection, optimizer, train_datal
             music_embedding = batch["music_embedding"].to(model.device)
             audio_input = projection(music_embedding).to(torch.bfloat16)
             B = audio_input.shape[0]
-
 
             image_ids = batch["image_ids"]
             image_gen_embeds = batch["image_gen_embeds"].to(torch.bfloat16)
@@ -340,12 +340,14 @@ def val_loop(model, processor, projection, val_dataloader, train_config,
         fid = metrics.get('fid', None)
         inception_score = metrics.get('inception_score', None)
 
-
     if not generate_freq:
         generate_freq = len(val_dataloader) + 1
 
     model.eval()
     projection.eval()
+
+    wandb_images = []
+    wandb_images_target = []
     for batch in tqdm(val_dataloader):
         batch = post_process_batch(model, batch)
 
@@ -375,16 +377,8 @@ def val_loop(model, processor, projection, val_dataloader, train_config,
             logits = model.gen_head(hidden_states)
 
             loss = criterion(logits[:, -576:-1, :].flatten(0, 1), batch_input_ids[:, 1:].flatten(0, 1))
-            sumloss += loss.item()
-
-        num_batches += 1
-
-        val_res = {
-            "loss": sumloss / num_batches if num_batches > 0 else 0,
-            "num_batches": num_batches,
-            # mock values
-            "imagebind_sim": 0,
-        }
+            epoch_loss = loss.item()
+            sumloss += epoch_loss
 
         if num_batches % generate_freq == 0:
             rand_index = random.randint(0, batch_input_ids.shape[0] - 1)
@@ -394,11 +388,9 @@ def val_loop(model, processor, projection, val_dataloader, train_config,
                                              image_token_num, processor, model,
                                              file_prefix=f"epoch_{epoch}_batch_{num_batches}")
             wandb_image = wandb.Image(visual_img[rand_index], caption=f"Epoch {epoch}, batch: {num_batches}, "
-                                                             f"loss: {val_res['loss']} "
-                                                             f"audio: {batch['audio_paths'][rand_index]}")
-
-
-
+                                                                      f"loss: {epoch_loss} "
+                                                                      f"audio: {batch['audio_paths'][rand_index]}")
+            wandb_images.append(wandb_image)
             target_images = batch["images"].cuda()
 
             if target_images.dtype != torch.uint8:
@@ -407,9 +399,8 @@ def val_loop(model, processor, projection, val_dataloader, train_config,
                 target_images = target_images.permute(0, 3, 1, 2)
 
             wandb_target = wandb.Image(target_images[rand_index].cpu(), caption=f"Epoch {epoch}, batch: {num_batches}, "
-                                                                            f"loss: {val_res['loss']} ")
-            val_res["Generated Example"] = wandb_image
-            val_res["Target Image"] = wandb_target
+                                                                                f"loss: {epoch_loss} ")
+            wandb_images_target.append(wandb_target)
 
             if fid is not None:
                 fid.update(target_images, real=True)
@@ -417,17 +408,30 @@ def val_loop(model, processor, projection, val_dataloader, train_config,
             if inception_score is not None:
                 inception_score.update(visual_img)
 
-            try:
-                if fid is not None:
-                    val_res["fid"] = fid.compute()
-                if inception_score is not None:
-                    val_res["inception_score_mean"], val_res["inception_score_std"] = inception_score.compute()
-            except RuntimeError as e:
-                val_res["fid"] = 0
-                val_res["inception_score_mean"], val_res["inception_score_std"] = 0, 0
+        num_batches += 1
 
-        val_res = {f"val_{k}": v for k, v in val_res.items()}
-        metric_logger.log(val_res)
+    val_res = {
+        "loss": sumloss / num_batches if num_batches > 0 else 0,
+        "num_batches": num_batches,
+        # mock values
+        "imagebind_sim": 0,
+        "generated_images": wandb_images,
+        "target_images": wandb_images_target,
+    }
+
+    try:
+        if fid is not None:
+            val_res["fid"] = fid.compute()
+        if inception_score is not None:
+            val_res["inception_score_mean"], val_res["inception_score_std"] = inception_score.compute()
+
+    except RuntimeError as e:
+        val_res["fid"] = 0
+        val_res["inception_score_mean"], val_res["inception_score_std"] = 0, 0
+
+    val_res = {f"val_{k}": v for k, v in val_res.items()}
+
+    metric_logger.log(val_res)
 
     return val_res
 
@@ -435,7 +439,7 @@ def val_loop(model, processor, projection, val_dataloader, train_config,
 class TrainConfig:
     log_level = "DEBUG"
 
-    num_epochs = 30
+    num_epochs = 120
     train_batch_size = 60
     val_batch_size = 10
     log_grad_norm = True
@@ -453,16 +457,16 @@ class TrainConfig:
     proj_dropout = 0.1
     proj_activation = 'gelu'
     proj_use_l2 = True
-    proj_scale_up = 3
+    proj_scale_up = 4
 
-    gen_freq = 110
-
-    few_val_samples = 60
+    gen_freq = 130
+    few_val_samples = 100
     dataloader_num_workers = 0
     dataset_name = "matched_dataset_0_15.pkl"
     val_dataset_name = "val_dataset.pkl"
 
-    sys_prompt = "Detailed art that contains abstract figures"
+    sys_prompt = "Detailed rich artwork that reflect emotions and moods of the music: "
+
     # sys_prompt = None
 
     @classmethod
@@ -514,14 +518,14 @@ def train(
             validation_metrics = val_loop(model, processor, projection, val_dataloader, train_config=train_config,
                                           epoch=epoch, metrics=metrics, no_loss=False, metric_logger=metric_logger,
                                           generate_freq=1, mock_run=mock_run)
-            final_fid_score = validation_metrics["fid"]
-            print(f"Epoch {epoch} validation metrics: {validation_metrics}")
+            final_fid_score = validation_metrics["val_fid"]
 
             if final_fid_score < best_fid or best_fid == 0:
                 best_fid = final_fid_score
                 print("New best fid: ", best_fid)
 
     torch.save(projection.state_dict(), f"proj_seq_{TrainConfig.proj_seq_len}_fid_{best_fid}.pt")
+
 
 def freeze_model(model):
     for p in model.parameters():
