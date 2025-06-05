@@ -10,157 +10,16 @@ from torch.utils.data import DataLoader, Dataset
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
 from tqdm.auto import tqdm
-from PIL import Image
-from torchvision.transforms import ToTensor
-from accelerate import Accelerator
 from torch.optim import Adam, AdamW
 from Janus.janus.models import MultiModalityCausalLM, VLChatProcessor
 from core.projection import AudioProjection
 import wandb
 
 from core.projection.projector import ImprovedAudioProjection
+from core.utils import generate_sample
+from core.training.data import ImageAudioDataset, post_process_batch
 
 wandb.login(key="af7a0ee3c846dd80ff62ec27a2046eb9b809b646")
-
-
-def generate_sample(music_embedding, batched_prompt_embeds, image_start_embeds, image_token_num_per_image, processor,
-                    model, file_prefix):
-    cfg_weight = 5
-    temperature = 1
-    img_size = 384
-    patch_size = 16
-
-    parallel_size = music_embedding.shape[0]
-    conditional_embeds = torch.concat([music_embedding, batched_prompt_embeds, image_start_embeds], dim=1)
-    unconditional_tokens = torch.zeros((1, conditional_embeds.shape[-2]), dtype=torch.int).cuda()
-    unconditional_tokens[0, 1:-1] = processor.pad_id
-    unconditional_embeds = model.language_model.get_input_embeddings()(unconditional_tokens)
-    gen_input_embeds = torch.zeros(
-        (conditional_embeds.shape[0] * 2, conditional_embeds.shape[1], conditional_embeds.shape[2]),
-        dtype=torch.bfloat16).cuda()
-
-    for i in range(parallel_size * 2):
-        if i % 2 != 0:
-            gen_input_embeds[i] = unconditional_embeds
-        else:
-            gen_input_embeds[i] = conditional_embeds[i // 2]
-
-    generated_tokens = torch.zeros((parallel_size, image_token_num_per_image), dtype=torch.int).cuda()
-    inputs_embeds = gen_input_embeds
-    for i in range(image_token_num_per_image):
-        outputs = model.language_model.model(inputs_embeds=inputs_embeds, use_cache=True,
-                                             past_key_values=outputs.past_key_values if i != 0 else None)
-        hidden_states = outputs.last_hidden_state
-
-        logits = model.gen_head(hidden_states[:, -1, :])
-        logit_cond = logits[0::2, :]
-        logit_uncond = logits[1::2, :]
-
-        logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
-        probs = torch.softmax(logits / temperature, dim=-1)
-
-        next_token = torch.multinomial(probs, num_samples=1)
-        generated_tokens[:, i] = next_token.squeeze(dim=-1)
-
-        next_token = torch.cat([next_token.unsqueeze(dim=1), next_token.unsqueeze(dim=1)], dim=1).view(-1)
-        img_embeds = model.prepare_gen_img_embeds(next_token)
-        inputs_embeds = img_embeds.unsqueeze(dim=1)
-
-    dec = model.gen_vision_model.decode_code(generated_tokens.to(dtype=torch.int),
-                                             shape=[parallel_size, 8, img_size // patch_size,
-                                                    img_size // patch_size])
-    dec = dec.to(torch.float32)
-    dec = torch.clamp((dec + 1) / 2 * 255, min=0, max=255)
-
-    # visual_img = dec.cpu().numpy().transpose(0, 2, 3, 1).astype(np.uint8)
-
-    # os.makedirs('generated_samples', exist_ok=True)
-    # for i in range(parallel_size):
-    #     save_path = os.path.join('generated_samples', "{}_{}.jpg".format(file_prefix, i))
-    #     Image.fromarray(visual_img[i]).save(save_path)
-
-    visual_img = dec.to(torch.uint8)
-    return visual_img
-
-
-class ImageAudioDataset(Dataset):
-    def __init__(self, dataframe, transform=None):
-        self.dataframe = dataframe
-        current_path = os.getcwd()
-
-        self.dataframe["image_path"] = self.dataframe["image_path"].apply(
-            lambda x: os.path.abspath(
-                os.path.join(current_path, "data/images/" + x.split("/images/")[-1].replace("\\", "/"))))
-
-        self.dataframe["audio_path"] = self.dataframe["audio_path"].apply(
-            lambda x: os.path.abspath(
-                os.path.join(current_path, "data/music/" + x.split("/music")[-1].replace("\\", "/"))))
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.dataframe)
-
-    def __getitem__(self, idx) -> dict:
-        image_path = self.dataframe.iloc[idx]["image_path"]
-        audio_path = self.dataframe.iloc[idx]["audio_path"]
-        image = Image.open(image_path).convert("RGB")
-        if self.transform:
-            image = self.transform(image)
-        else:
-            image = ToTensor()(image)
-            image = nn.functional.interpolate(image.unsqueeze(0), size=(384, 384), mode='bilinear', align_corners=False)
-
-        image_embedding = self.dataframe.iloc[idx]["image_embedding"]
-        music_embedding = self.dataframe.iloc[idx]["music_embedding"]
-        return {
-            "audio_path": audio_path,
-            "image": image,
-            "music_embedding": music_embedding,
-            "image_embedding": image_embedding,
-        }
-
-
-def get_collate_fn(gen_model: MultiModalityCausalLM):
-    def collate_fn(items):
-        result = dict()
-        with torch.no_grad():
-            images = torch.cat([item["image"] for item in items], dim=0)
-            quant, _, info = gen_model.gen_vision_model.encode(
-                images.to(dtype=torch.bfloat16).cuda())
-            B, C, Hq, Wq = quant.shape
-            _, _, min_encoding_indices = info
-            image_ids = min_encoding_indices.view(B, Hq * Wq)
-            gen_embeds = gen_model.prepare_gen_img_embeds(image_ids)
-
-        result["image_ids"] = image_ids.squeeze(-1)
-        result["image_gen_embeds"] = gen_embeds
-        result["music_embedding"] = torch.stack([torch.from_numpy(item["music_embedding"]) for item in items], dim=0)
-        result["images"] = images
-        result["audio_paths"] = [item["audio_path"] for item in items]
-
-        return result
-
-    return collate_fn
-
-
-def post_process_batch(gen_model, batch):
-    result = dict()
-    with torch.no_grad():
-        images = torch.cat([image for image in batch["image"]], dim=0)
-        quant, _, info = gen_model.gen_vision_model.encode(
-            images.to(dtype=torch.bfloat16).cuda())
-        B, C, Hq, Wq = quant.shape
-        _, _, min_encoding_indices = info
-        image_ids = min_encoding_indices.view(B, Hq * Wq)
-        gen_embeds = gen_model.prepare_gen_img_embeds(image_ids)
-
-    result["image_ids"] = image_ids.squeeze(-1)
-    result["image_gen_embeds"] = gen_embeds
-    result["music_embedding"] = torch.stack([item for item in batch["music_embedding"]], dim=0)
-    result["images"] = images
-    result["audio_paths"] = [item for item in batch["audio_path"]]
-
-    return result
 
 
 def train_loop(accelerator, model, processor, projection, optimizer, train_dataloader, epoch, criterion, train_config,
