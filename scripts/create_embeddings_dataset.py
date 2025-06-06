@@ -65,7 +65,11 @@ def create_audio_dataset(audio_dir: str, output_path: str, count: int = 10) -> p
         if audio_count >= count:
             break
         if not os.path.isdir(os.path.join(audio_dir, sub_dir)):
-            continue
+            if os.path.join(audio_dir, sub_dir).endswith(".mp3"):
+                audio_paths.append(os.path.join(audio_dir, sub_dir))
+                audio_count += 1
+                continue
+
         sub_dir_path = os.path.join(audio_dir, sub_dir)
         for audio_file in os.listdir(sub_dir_path):
             if audio_count >= count:
@@ -81,6 +85,20 @@ def create_audio_dataset(audio_dir: str, output_path: str, count: int = 10) -> p
 
     df.to_csv(output_path, index=False)
     return df
+
+
+def create_audio_embeddings(audio_df_path: str, output_path: str, count: int = 100, offset: int = 0):
+    audio_df = pd.read_csv(audio_df_path)
+    audio_paths = audio_df["audio_path"].tolist()[offset: offset + count]
+    embeddings = []
+    print(f"Number of audio files: {len(audio_paths)}")
+    embedder = ImageBindEmbedder()
+    for i, f in enumerate(audio_paths):
+        print(f"{i}: {f}")
+
+    embeddings = embedder.embed_audio(audio_paths)
+    audio_df["embeddings"] = embeddings.tolist()
+    audio_df.to_pickle(output_path)
 
 
 def batch_create_audio_embeddings(audio_df_path: str, output_dir: str, batch_size: int = 10, count: int = 100, offset: int = 0):
